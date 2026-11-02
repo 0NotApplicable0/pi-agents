@@ -13,6 +13,7 @@ import {
   type ToolRegistration,
   UsageDoc,
 } from "@earendil-works/pi-durable";
+import type { CollabMembership } from "../collab/membership.js";
 import { withCodemodeModels } from "../host/tools.js";
 import { summarizeUsage, sumUsage } from "./derive.js";
 import type { NodeResult } from "./graphs.js";
@@ -34,28 +35,37 @@ import type { NodeKind, ReportNode } from "./report.js";
 import { resolveEdges } from "./topology.js";
 import {
   AgentError,
+  GRAPH_SIZE,
   type HelperDefaults,
   type HelperResolver,
   isThinkingLevel,
+  MAX_DEPTH,
   type SpawnSpec,
 } from "./types.js";
 
 type Api = ToolExecutionApi;
 
-/** How far spawning reaches. Fixed: no configuration. */
+/** How far spawning reaches: these defaults, or the session's
+ * `piAgents` settings. */
 export interface SpawningLimits {
-  /** Helpers one call starts. */
+  /** Agents one call starts, also the parent's. */
   perCall: number;
   /** Helpers one agent starts over its lifetime. */
   perAgent: number;
   /** Helpers working at once across the session. */
   active: number;
+  /** How deep agents nest: agents at this depth can't spawn. */
+  depth: number;
+  /** Agents per sub-team that one spawn forms. */
+  teamSize: number;
 }
 
 export const SPAWNING_LIMITS: SpawningLimits = {
-  perCall: 12,
+  perCall: GRAPH_SIZE.max,
   perAgent: 24,
   active: 16,
+  depth: MAX_DEPTH,
+  teamSize: 12,
 };
 
 export const HELPER_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
@@ -114,6 +124,9 @@ export interface Planned {
   name: string;
   spec: SpawnSpec;
   tools: ToolRegistration[];
+  /** Its collab group: the call's, else its spawner's. Absent for a
+   * competition's helpers, which work alone. */
+  collab?: CollabMembership;
 }
 
 /** Resolve and check every helper before anything starts. */

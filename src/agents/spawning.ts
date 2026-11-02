@@ -42,6 +42,13 @@ import {
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import { type Static, Type } from "typebox";
+import { type CollabMembership, resolveCollab } from "../collab/membership.js";
+import {
+  groupParameter,
+  leadParameter,
+  roleParameter,
+  teamParameter,
+} from "../collab/schema.js";
 import { GraphTask, NodeTask } from "./graphs.js";
 import type { MessagingHub } from "./hub.js";
 import { UNBOUNDED_OUTPUT } from "./messaging.js";
@@ -77,7 +84,6 @@ import {
   type GraphPolicy,
   type HelperResolver,
   isThinkingLevel,
-  MAX_DEPTH,
   THINKING_LEVELS,
 } from "./types.js";
 
@@ -89,8 +95,12 @@ export const SPAWNING_TOOLS = [SPAWN_TOOL, WAIT_TOOL, STOP_TOOL] as const;
 
 type Api = ToolExecutionApi;
 
-/** What a new agent selects, by whether it may spawn. */
-export type Selection = (spawn: boolean) => {
+/** What a new agent selects, by whether it may spawn and its collab
+ * membership; "all" asks for every tool a new agent could get. */
+export type Selection = (
+  spawn: boolean,
+  collab?: CollabMembership | "all",
+) => {
   extensions: readonly Extension[];
   tools: readonly ToolRegistration[];
 };
@@ -142,6 +152,10 @@ const agentFields = Type.Object({
         "Let this agent spawn agents of its own, which report back to it. Default false",
     }),
   ),
+  group: groupParameter,
+  role: roleParameter,
+  team: teamParameter,
+  lead: leadParameter,
 });
 
 const spawnParameters = Type.Object({
@@ -153,9 +167,8 @@ const spawnParameters = Type.Object({
   ),
   agents: Type.Array(agentFields, {
     minItems: GRAPH_SIZE.min,
-    maxItems: GRAPH_SIZE.max,
     description:
-      'Always an array, one entry per agent with its fields, also for a single agent: {"agents": [{"name": "lead", "job": "...", "spawn": true}]}',
+      'Always an array, one entry per agent with its fields, also for a single agent: {"agents": [{"name": "lead", "job": "...", "spawn": true}]}. At most 12 per call unless the session raised the limit',
   }),
   failFast: Type.Optional(
     Type.Boolean({ description: "Stop the other agents when one fails" }),
@@ -192,6 +205,10 @@ type SpawnArgs = {
     tools?: string[];
     skills?: string[];
     spawn?: boolean;
+    group?: string;
+    role?: string;
+    team?: string;
+    lead?: boolean;
   }>;
   failFast?: boolean;
 };
@@ -200,13 +217,14 @@ type SpawnArgs = {
 function spawner(
   agents: Readonly<Record<string, AgentRecord>> | undefined,
   id: string,
+  maxDepth: number,
 ): { record: AgentRecord; depth: number } | string {
   const record = agents?.[id];
   if (!record?.spawn) return `${SPAWN_TOOL} is not available to you.`;
   if (record.stopped) return "You were stopped and can't spawn agents.";
   const depth = record.depth;
-  if (depth >= MAX_DEPTH)
-    return `Agents at depth ${MAX_DEPTH} can't spawn agents.`;
+  if (depth >= maxDepth)
+    return `Agents at depth ${maxDepth} can't spawn agents.`;
   return { record, depth };
 }
 
@@ -306,7 +324,7 @@ async function start(
         ownership: { kind: "task", taskId: task },
       });
       const { spec } = helper;
-      const extra = options.selection(spec.spawn === true);
+      const extra = options.selection(spec.spawn === true, helper.collab);
       // Everything explicit: the copy of the spawning agent's settings must
       // not reach the new agent.
       await configure(tx, conversation.id, {
@@ -339,6 +357,7 @@ async function start(
         graph: String(graph),
         depth: owner.depth + 1,
         ...(helper.spec.spawn ? { spawn: true } : {}),
+        ...(helper.collab ? { collab: helper.collab } : {}),
       };
     });
     graphsDoc.graphs[String(graph)] = {
@@ -435,7 +454,7 @@ async function spawnExecute(
   // A rerun after a restart finds the group it started.
   let graphId = startedBy(graphs?.graphs, api.taskId);
   if (graphId === undefined) {
-    const allowed = spawner(agents?.agents, id);
+    const allowed = spawner(agents?.agents, id, options.limits.depth);
     if (typeof allowed === "string") return textResult(allowed, true);
     if (args.agents.length < GRAPH_SIZE.min)
       return textResult("Name at least one agent to spawn.", true);
@@ -445,7 +464,9 @@ async function spawnExecute(
       context,
     )) ?? {}) as DurableAgentState;
     const agent = await api.agent(context);
-    const own = new Set(options.selection(true).tools.map((tool) => tool.name));
+    const own = new Set(
+      options.selection(true, "all").tools.map((tool) => tool.name),
+    );
     // Agents get tools their spawner has, besides the tools that make
     // them agents.
     const ownTools = agent.tools.filter((tool) => !own.has(tool.name));
@@ -468,11 +489,35 @@ async function spawnExecute(
       // and never beyond the deepest level.
       for (const [index, helper] of planned.helpers.entries()) {
         const asked = args.agents[index]?.spawn === true;
-        if (asked && allowed.depth + 1 >= MAX_DEPTH)
+        if (asked && allowed.depth + 1 >= options.limits.depth)
           throw new AgentError(
-            `${helper.name} can't spawn agents: agents at depth ${MAX_DEPTH} can't, and it would be at depth ${allowed.depth + 1}.`,
+            `${helper.name} can't spawn agents: agents at depth ${options.limits.depth} can't, and it would be at depth ${allowed.depth + 1}.`,
           );
         helper.spec = { ...helper.spec, spawn: asked };
+        // A helper joins the group the call names, else its spawner's,
+        // else the default one. A competition's agents work alone, so
+        // their helpers join no group and stay out of reach.
+        if (!allowed.record.collab?.competition) {
+          const entry = args.agents[index];
+          const spawner = allowed.record.collab;
+          const group = entry?.group ?? spawner?.group;
+          // A lead's helpers join its team, when they stay in its group.
+          const team =
+            entry?.team ??
+            (spawner?.lead && spawner.team && group === spawner.group
+              ? spawner.team
+              : undefined);
+          helper.collab = resolveCollab(
+            {
+              ...(group ? { group } : {}),
+              ...(entry?.role ? { role: entry.role } : {}),
+              ...(team ? { team } : {}),
+              ...(entry?.lead ? { lead: true } : {}),
+            },
+            helper.spec.profile ?? helper.name,
+            helper.spec.cwd,
+          );
+        }
       }
     } catch (error) {
       return textResult(errorText(error), true);

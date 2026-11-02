@@ -8,7 +8,7 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import type { AgentService } from "../../src/agents/service.js";
-import { readWorkingLimit } from "../../src/host/working.js";
+import { DEFAULT_LIMITS, readLimits } from "../../src/host/settings.js";
 import {
   briefly,
   closeService,
@@ -77,18 +77,54 @@ function switches(sessions: string[]): number {
   ).length;
 }
 
-test("the cap comes from piAgents.maxWorkingAgents", () => {
-  expect(readWorkingLimit({})).toEqual({});
-  expect(readWorkingLimit({ piAgents: { maxWorkingAgents: 2 } })).toEqual({
-    limit: 2,
-  });
-  for (const value of [0, 1.5, "1"]) {
-    const { limit, error } = readWorkingLimit({
+test("the cap comes from piAgents.maxWorkingAgents, 32 by default", () => {
+  expect(readLimits({}).limits.maxWorkingAgents).toBe(32);
+  expect(
+    readLimits({ piAgents: { maxWorkingAgents: 2 } }).limits.maxWorkingAgents,
+  ).toBe(2);
+  const off = readLimits({ piAgents: { maxWorkingAgents: 0 } });
+  expect(off.errors).toEqual([]);
+  expect(off.limits.maxWorkingAgents).toBeUndefined();
+  for (const value of [-1, 1.5, "1"]) {
+    const { limits, errors } = readLimits({
       piAgents: { maxWorkingAgents: value },
     });
-    expect(limit).toBeUndefined();
-    expect(error).toContain("positive integer");
+    expect(limits.maxWorkingAgents).toBe(DEFAULT_LIMITS.maxWorkingAgents);
+    expect(errors.join()).toContain("or 0 (no cap)");
   }
+});
+
+test("limits come from piAgents settings over the defaults", () => {
+  expect(readLimits({})).toEqual({ limits: { ...DEFAULT_LIMITS }, errors: [] });
+  const raised = readLimits({
+    piAgents: {
+      maxAgentsPerSpawn: 100,
+      maxSpawnedPerAgent: 100,
+      maxActiveSpawned: 100,
+      maxDepth: 4,
+      maxSolvers: 10,
+      maxWorkingAgents: 100,
+    },
+  });
+  expect(raised).toEqual({
+    limits: {
+      ...DEFAULT_LIMITS,
+      maxAgentsPerSpawn: 100,
+      maxSpawnedPerAgent: 100,
+      maxActiveSpawned: 100,
+      maxDepth: 4,
+      maxSolvers: 10,
+      maxWorkingAgents: 100,
+    },
+    errors: [],
+  });
+  const wrong = readLimits({ piAgents: { maxDepth: 0, maxSolvers: 1 } });
+  expect(wrong.limits.maxDepth).toBe(3);
+  expect(wrong.limits.maxSolvers).toBe(6);
+  expect(wrong.errors).toHaveLength(2);
+  expect(readLimits({ piAgents: 5 }).errors).toEqual([
+    "piAgents must be an object",
+  ]);
 });
 
 describe("agents with a working cap", () => {

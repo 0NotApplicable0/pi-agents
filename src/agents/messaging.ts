@@ -246,12 +246,14 @@ export const SendOutput = Type.Object(
 /**
  * Whom an agent can reach: the agent that spawned it and the others it
  * spawned with it, or, for the parent's agents, each other; and the agents
- * it spawned itself.
+ * it spawned itself. With `group` (collab_send), also the other members of
+ * its collab group, wherever they were spawned.
  */
 function scopeOf(
   agents: Readonly<Record<string, AgentRecord>>,
   graphs: Readonly<GraphsState> | undefined,
   self: string,
+  options: { group?: boolean } = {},
 ): Set<string> {
   const scope = new Set<string>();
   const record = agents[self];
@@ -265,6 +267,18 @@ function scopeOf(
       const graph = graphs?.graphs[other.graph];
       if (!graph?.owner) scope.add(id);
     }
+  // Members of a collab group reach each other with collab_send.
+  const collab = record.collab;
+  if (options.group && collab && !collab.competition)
+    for (const [id, other] of Object.entries(agents))
+      if (other.collab?.group === collab.group && !other.collab.competition)
+        scope.add(id);
+  // A competition's agents are blind to everyone but the agents they
+  // spawned, and nobody else reaches them.
+  if (collab?.competition) scope.clear();
+  else
+    for (const id of [...scope])
+      if (agents[id]?.collab?.competition) scope.delete(id);
   for (const graph of Object.values(graphs?.graphs ?? {}))
     if (isSpawned(graph) && graph.owner.agent === self)
       for (const node of graph.nodes) scope.add(node.agent);
@@ -278,8 +292,9 @@ function resolve(
   graphs: Readonly<GraphsState> | undefined,
   self: string,
   name: string,
+  options: { group?: boolean } = {},
 ): [string, AgentRecord] | undefined {
-  const scope = scopeOf(agents, graphs, self);
+  const scope = scopeOf(agents, graphs, self, options);
   const byId = Object.hasOwn(agents, name) ? agents[name] : undefined;
   if (byId) return scope.has(name) ? [name, byId] : undefined;
   const named = Object.entries(agents)
@@ -338,9 +353,13 @@ export async function awaitsJob(
   );
 }
 
+function memoName(args: Pick<SendArgs, "slot">): string {
+  return args.slot ? `message:${args.slot}` : "message";
+}
+
 /** The first run of a send: check it and bind its recipient. */
 async function bind(
-  args: { name: string; message: string; mode?: unknown; followUp?: unknown },
+  args: SendArgs,
   api: ToolExecutionApi,
   context: Context,
 ): Promise<Binding | string> {
@@ -354,14 +373,16 @@ async function bind(
   const from = String(api.conversationId);
   const sender = agents[from];
   if (!sender) return `${SEND_TOOL} is not available to you.`;
-  const target = resolve(agents, graphs, from, args.name);
+  const target = resolve(agents, graphs, from, args.name, {
+    group: args.group === true,
+  });
   if (!target) return `No agent named ${args.name} within your reach.`;
   const [to, recipient] = target;
   if (to === from) return "You can't message yourself.";
   return api.memo<Binding>(
-    "message",
+    memoName(args),
     {
-      id: `message:${from}:${api.taskId}`,
+      id: `message:${from}:${api.taskId}${args.slot ? `:${args.slot}` : ""}`,
       from,
       sender: sender.name,
       to,
@@ -453,107 +474,127 @@ export function createMessagingExtension(
         }),
         structuredOutputSchema: SendOutput,
         replay: "safe",
-        async execute(args, api, context) {
-          // A rerun replays the first run's binding.
-          const bound =
-            (await api.memo<Binding>("message", context)) ??
-            (await bind(args, api, context));
-          if (typeof bound === "string") return textResult(bound, true);
-          await options.afterBind?.(context);
-          const to = Number(bound.to) as ConversationId;
-          // What this run's interrupt found: whether the recipient worked,
-          // and how many queued messages it dropped.
-          let interrupted: { working: boolean; dropped: number } | undefined;
-          const work = async (hold: (pending: Promise<unknown>) => void) => {
-            if (bound.mode === "interrupt") {
-              const admitted = await api.commit(
-                (tx) => admit(tx, bound),
-                context,
-              );
-              if (admitted !== "new" && admitted !== "logged") return admitted;
-              if (admitted === "new") {
-                const conversation = await api.conversation(to, context);
-                if (!conversation) return "missing";
-                interrupted = {
-                  working: hub.state(bound.to) === "working",
-                  dropped: queuedMessages(
-                    await api.snapshot(InboxDoc, to, context),
-                  ),
-                };
-                // A cancelled call stops waiting for the abort and ends its
-                // send here; the turn holds until the watermark.
-                const fence = hub.interrupt(bound.to);
-                hold(fence);
-                await awaitWithContext(fence, context);
-              }
-            }
-            const logged = await api.commit(async (tx) => {
-              const admitted = await admit(tx, bound);
-              if (admitted !== "new") return admitted;
-              const log = await tx.doc(MessagesDoc);
-              log.messages.push({
-                id: bound.id,
-                from: bound.from,
-                to: bound.to,
-                text: bound.text,
-                mode: whenBusyOf(bound.mode),
-                sentAt: bound.sentAt,
-              });
-              const over = log.messages.length - MESSAGE_MEMORY;
-              if (over > 0) {
-                log.messages.splice(0, over);
-                log.dropped = (log.dropped ?? 0) + over;
-              }
-              return "logged";
-            }, context);
-            if (logged !== "logged") return logged;
-            await options.afterLog?.(context);
-            // Once logged, the message is submitted, also when the call is
-            // cancelled meanwhile.
-            const durable = withoutAbortSignal(context);
-            const conversation = await api.conversation(to, durable);
-            if (!conversation) return "missing";
-            await conversation.submit(
-              messageSubmission(
-                { ...bound, mode: whenBusyOf(bound.mode) },
-                bound.sender,
-              ),
-              durable,
-            );
-            return "sent";
-          };
-          // A call cancelled while it waits for the recipient's turn gives
-          // it up, so its own agent's abort never waits on a turn.
-          const outcome = await hub.turn(bound.to, work, context);
-          if (outcome === "missing")
-            return textResult(`No agent named ${bound.recipient}.`, true);
-          if (outcome === "stopped")
-            return textResult(
-              `${bound.recipient} was stopped and doesn't take messages from agents.`,
-              true,
-            );
-          if (outcome === "blocked")
-            return textResult(
-              `${bound.recipient} waits for the agents its job needs and hasn't started; message it once it works.`,
-              true,
-            );
-          const working = interrupted?.working === true;
-          const dropped = interrupted?.dropped ?? 0;
-          const sent = working
-            ? `Interrupted ${bound.recipient} and sent the message.`
-            : `Sent to ${bound.recipient}.`;
-          const structured: Static<typeof SendOutput> = {
-            to: bound.recipient,
-            mode: bound.mode,
-            interrupted: working,
-            dropped,
-          };
-          return {
-            output: [{ type: "text", text: `${sent}${droppedNote(dropped)}` }],
-            structuredOutput: structured,
-          };
-        },
+        execute: (args, api, context) =>
+          sendMessage(hub, options, args, api, context),
       }),
     ],
   });
+}
+
+type SendArgs = {
+  name: string;
+  message: string;
+  mode?: unknown;
+  followUp?: unknown;
+  /** collab_send: reach the sender's collab group too. */
+  group?: boolean;
+  /** One of several sends in one call, such as a broadcast's recipient:
+   * each slot binds and logs apart. */
+  slot?: string;
+};
+
+/**
+ * The body of `agent_send`, which the collab tools share: send `message`
+ * to the agent `name` within the sender's reach, exactly once.
+ */
+export async function sendMessage(
+  hub: MessagingHub,
+  options: MessagingOptions,
+  args: SendArgs,
+  api: ToolExecutionApi,
+  context: Context,
+): Promise<ToolExecutionResult> {
+  // A rerun replays the first run's binding.
+  const bound =
+    (await api.memo<Binding>(memoName(args), context)) ??
+    (await bind(args, api, context));
+  if (typeof bound === "string") return textResult(bound, true);
+  await options.afterBind?.(context);
+  const to = Number(bound.to) as ConversationId;
+  // What this run's interrupt found: whether the recipient worked,
+  // and how many queued messages it dropped.
+  let interrupted: { working: boolean; dropped: number } | undefined;
+  const work = async (hold: (pending: Promise<unknown>) => void) => {
+    if (bound.mode === "interrupt") {
+      const admitted = await api.commit((tx) => admit(tx, bound), context);
+      if (admitted !== "new" && admitted !== "logged") return admitted;
+      if (admitted === "new") {
+        const conversation = await api.conversation(to, context);
+        if (!conversation) return "missing";
+        interrupted = {
+          working: hub.state(bound.to) === "working",
+          dropped: queuedMessages(await api.snapshot(InboxDoc, to, context)),
+        };
+        // A cancelled call stops waiting for the abort and ends its
+        // send here; the turn holds until the watermark.
+        const fence = hub.interrupt(bound.to);
+        hold(fence);
+        await awaitWithContext(fence, context);
+      }
+    }
+    const logged = await api.commit(async (tx) => {
+      const admitted = await admit(tx, bound);
+      if (admitted !== "new") return admitted;
+      const log = await tx.doc(MessagesDoc);
+      log.messages.push({
+        id: bound.id,
+        from: bound.from,
+        to: bound.to,
+        text: bound.text,
+        mode: whenBusyOf(bound.mode),
+        sentAt: bound.sentAt,
+      });
+      const over = log.messages.length - MESSAGE_MEMORY;
+      if (over > 0) {
+        log.messages.splice(0, over);
+        log.dropped = (log.dropped ?? 0) + over;
+      }
+      return "logged";
+    }, context);
+    if (logged !== "logged") return logged;
+    await options.afterLog?.(context);
+    // Once logged, the message is submitted, also when the call is
+    // cancelled meanwhile.
+    const durable = withoutAbortSignal(context);
+    const conversation = await api.conversation(to, durable);
+    if (!conversation) return "missing";
+    await conversation.submit(
+      messageSubmission(
+        { ...bound, mode: whenBusyOf(bound.mode) },
+        bound.sender,
+      ),
+      durable,
+    );
+    return "sent";
+  };
+  // A call cancelled while it waits for the recipient's turn gives
+  // it up, so its own agent's abort never waits on a turn.
+  const outcome = await hub.turn(bound.to, work, context);
+  if (outcome === "missing")
+    return textResult(`No agent named ${bound.recipient}.`, true);
+  if (outcome === "stopped")
+    return textResult(
+      `${bound.recipient} was stopped and doesn't take messages from agents.`,
+      true,
+    );
+  if (outcome === "blocked")
+    return textResult(
+      `${bound.recipient} waits for the agents its job needs and hasn't started; message it once it works.`,
+      true,
+    );
+  const working = interrupted?.working === true;
+  const dropped = interrupted?.dropped ?? 0;
+  const sent = working
+    ? `Interrupted ${bound.recipient} and sent the message.`
+    : `Sent to ${bound.recipient}.`;
+  const structured: Static<typeof SendOutput> = {
+    to: bound.recipient,
+    mode: bound.mode,
+    interrupted: working,
+    dropped,
+  };
+  return {
+    output: [{ type: "text", text: `${sent}${droppedNote(dropped)}` }],
+    structuredOutput: structured,
+  };
 }

@@ -23,7 +23,9 @@ in the attach view. The recipient's answer stays with it.
 
 Pi's agents reach each other. An agent that another agent spawned reaches
 that agent and the others spawned with it, and every agent reaches the
-agents it spawned. An agent you or Pi stopped refuses messages from agents
+agents it spawned. With `collab_send`, an agent also reaches every member
+of its [collab group](./collab.md), wherever it was spawned; a
+competition's agents reach nobody, and nobody reaches them. An agent you or Pi stopped refuses messages from agents
 until you or Pi message it again. An agent that still waits for the agents
 its job needs refuses them until it starts.
 

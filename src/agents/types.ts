@@ -6,6 +6,8 @@
  * agents; nothing outside `src/host` and `src/agents` sees pi-durable.
  */
 
+import type { CollabMembership, CollabRequest } from "../collab/membership.js";
+
 export const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -136,6 +138,9 @@ export interface AgentInfo {
   graph?: string;
   /** Whether the agent may spawn agents of its own. */
   spawn?: boolean;
+  /** Its collab group or competition; absent only for agents created
+   * before collab groups existed, and for a competition's helpers. */
+  collab?: CollabMembership;
   /** The agent that spawned this one, by agent ID; absent for the
    * parent's agents. */
   owner?: string;
@@ -230,7 +235,8 @@ export interface GraphInfo {
   stalled?: Stall;
 }
 
-/** How many agents one spawn starts. */
+/** How many agents one spawn starts: `max` is the default of the
+ * `piAgents.maxAgentsPerSpawn` setting. */
 export const GRAPH_SIZE = { min: 1, max: 12 } as const;
 
 /** How `agent_spawn` takes its agents, in full for its error; the
@@ -255,7 +261,7 @@ export function checkSpawnShape(args: unknown): unknown {
 }
 
 /** How deep agents nest: the parent's agents are at depth 1, and an agent
- * at the deepest level can't spawn. */
+ * at the deepest level can't spawn. The default of `piAgents.maxDepth`. */
 export const MAX_DEPTH = 3;
 
 export interface GraphAgentSpec extends SpawnSpec {
@@ -267,6 +273,9 @@ export interface GraphSpec {
   name?: string;
   failFast?: boolean;
   agents: GraphAgentSpec[];
+  /** The most agents it may have; the session's per-spawn limit when
+   * absent. A competition's graph holds its solvers and judge. */
+  maxAgents?: number;
 }
 
 /** An agent or a graph by its immutable ID. */
@@ -308,6 +317,10 @@ export interface SpawnSpec {
   ambientSkills?: boolean;
   /** Whether the agent may spawn agents of its own. */
   spawn?: boolean;
+  /** Its collab group and role (the default group and the profile or
+   * name otherwise), or, for the parent's competitions, its part in a
+   * competition. */
+  collab?: CollabRequest & Partial<CollabMembership>;
 }
 
 /** What a spawning agent asks for one of its agents. */

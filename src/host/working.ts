@@ -7,6 +7,9 @@
  * order of arrival. An agent that waits for the agents it spawned gives its
  * slot up meanwhile, so they can work.
  *
+ * The cap is `piAgents.maxWorkingAgents`, 32 unless set; 0 turns it off
+ * (see `readLimits`).
+ *
  * Slots are taken in the hooks before generation requests and before
  * compactions summarize. A compaction that a restart resumes mid-summary
  * passes no hook and runs without a slot.
@@ -23,20 +26,6 @@ import {
   LiveDoc,
   type LiveState,
 } from "@earendil-works/pi-durable";
-import { readPositiveInteger } from "./settings.js";
-
-/**
- * The cap from Pi's merged settings: `piAgents.maxWorkingAgents`. Absent
- * means no cap; anything but a positive integer is an error, and agents
- * then aren't capped.
- */
-export function readWorkingLimit(settings: unknown): {
-  limit?: number;
-  error?: string;
-} {
-  const { value, error } = readPositiveInteger(settings, "maxWorkingAgents");
-  return error ? { error } : value === undefined ? {} : { limit: value };
-}
 
 /** What the cap knows of an agent from its `LiveDoc`. */
 interface Live {

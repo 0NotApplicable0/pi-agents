@@ -8,6 +8,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { registerCollab } from "./pi/collab.js";
 import { registerCommands } from "./pi/commands.js";
 import { AgentStatePublisher } from "./pi/events.js";
 import { registerMessageRenderers } from "./pi/messages.js";
@@ -33,6 +34,7 @@ export default function agentExtension(pi: ExtensionAPI): void {
     pi.events,
     () => host.current()?.list() ?? [],
   );
+  const collab = registerCollab(pi, host);
   const panel = new AgentPanel(host);
   const focus = new FocusController(host, panel);
   const transcript = new MessageTranscript(pi);
@@ -73,6 +75,8 @@ export default function agentExtension(pi: ExtensionAPI): void {
     // Messages sent before messaging was turned off still get their cards,
     // also those a crash left behind and the service delivers at start.
     transcript.sync(host.current()?.messages() ?? []);
+    // Stopped collab members release their claims; deadlines hold.
+    void collab.monitor.tick();
   });
 
   registerMessageRenderers(pi);
@@ -148,6 +152,7 @@ export default function agentExtension(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => track(ctx));
 
   pi.on("session_shutdown", async (event, ctx) => {
+    collab.monitor.disarm();
     // Switching away pauses this session's agents; the next session tells
     // about them. Quitting pauses them too, but then nobody is left to tell.
     const service = host.current();

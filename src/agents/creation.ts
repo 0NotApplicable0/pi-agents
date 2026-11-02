@@ -7,12 +7,18 @@ import {
   type Harness,
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
+import {
+  type CollabMembership,
+  resolveCollab,
+  withTeam,
+} from "../collab/membership.js";
 import type { AgentExtensionState } from "../hooks.js";
 import {
   DEFAULT_AGENT_TOOLS,
   isCodemodeModelTool,
   withCodemodeModels,
 } from "../host/tools.js";
+import { collabSelection } from "./collab.js";
 import { CONTEXT } from "./context.js";
 import { type AgentExtensions, agentSelection } from "./extensions.js";
 import { GraphTask, NodeTask } from "./graphs.js";
@@ -65,9 +71,10 @@ export async function createGraph(
   spec: GraphSpec,
 ): Promise<{ id: string; agents: string[] }> {
   const count = spec.agents.length;
-  if (count < GRAPH_SIZE.min || count > GRAPH_SIZE.max)
+  const max = spec.maxAgents ?? deps.extensions.limits.perCall;
+  if (count < GRAPH_SIZE.min || count > max)
     throw new AgentError(
-      `A graph has ${GRAPH_SIZE.min} to ${GRAPH_SIZE.max} agents, not ${count}`,
+      `A graph has ${GRAPH_SIZE.min} to ${max} agents, not ${count}${spec.maxAgents === undefined ? " (the piAgents.maxAgentsPerSpawn setting raises the limit)" : ""}`,
     );
   // Validate with the service's view first; the commit claims for real.
   const single = count === 1;
@@ -100,6 +107,13 @@ export async function createGraph(
     spec: agent,
     name: planned.agents[index] as string,
     ...prepare(deps, agent),
+    // Every agent is in a collab group: the default one unless it names
+    // another; a competition's agents carry their competition instead.
+    collab: resolveCollab(
+      agent.collab ?? {},
+      agent.profile ?? (planned.agents[index] as string),
+      agent.cwd,
+    ),
   }));
   const inputs = resolveEdges(
     nodes.map((node) => ({ name: node.name, after: node.spec.after })),
@@ -135,7 +149,7 @@ export async function createGraph(
       const { spec: agent } = node;
       await configure(tx, conversation.id, {
         cwd: agent.cwd,
-        ...capabilities(deps, node.tools, agent.spawn),
+        ...capabilities(deps, node.tools, agent.spawn, node.collab),
         ...(agent.model ? { model: agent.model } : {}),
         ...(agent.thinking ? { thinkingLevel: agent.thinking } : {}),
         ...(agent.instructions ? { instructions: agent.instructions } : {}),
@@ -162,6 +176,16 @@ export async function createGraph(
         graph: String(graph),
         depth: 1,
         ...(node.spec.spawn ? { spawn: true } : {}),
+        ...(node.collab
+          ? {
+              collab: withTeam(node.collab, {
+                name: names.graph,
+                index,
+                count,
+                teamSize: deps.extensions.limits.teamSize,
+              }),
+            }
+          : {}),
       };
     });
     (await tx.doc(GraphsDoc)).graphs[String(graph)] = {
@@ -190,14 +214,20 @@ function capabilities(
   deps: CreationDeps,
   tools: ToolRegistration[],
   spawn: boolean | undefined,
+  collab: CollabMembership | undefined,
 ): { tools: ToolRegistration[]; extensions: Extension[] } {
-  const extensions = agentSelection(deps.extensions, {
-    spawn: !!spawn,
-    messaging: true,
-  });
+  const joined = collabSelection(deps.extensions, collab);
+  const extensions = [
+    ...agentSelection(deps.extensions, {
+      spawn: !!spawn,
+      messaging: true,
+    }),
+    ...joined.extensions,
+  ];
   const extra = [
     ...(spawn ? (deps.extensions.spawning.tools ?? []) : []),
     ...(deps.extensions.messaging.tools ?? []),
+    ...joined.tools,
   ];
   return { tools: [...tools, ...extra], extensions };
 }

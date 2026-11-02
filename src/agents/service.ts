@@ -519,6 +519,11 @@ export class AgentService {
     return { agent: this.requireAgent(info.id), dropped };
   }
 
+  /** Whether the agent was stopped; a closed agent that answered wasn't. */
+  isStopped(agentId: string): boolean {
+    return this.projection.agents()[agentId]?.stopped === true;
+  }
+
   /** Message an agent on behalf of the user; results stay in the agent. */
   async prompt(nameOrId: string, text: string, mode: SendMode): Promise<void> {
     const info = this.require(nameOrId);

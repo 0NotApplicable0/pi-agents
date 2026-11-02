@@ -14,6 +14,7 @@ import {
   type Storage,
 } from "@earendil-works/pi-durable";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
+import type { CollabBinding, TeamLimits } from "../../src/agents/collab.js";
 import {
   type AgentExtensions,
   createAgentExtensions,
@@ -254,6 +255,11 @@ export interface HostOptions {
   /** Harness hooks on agents' tasks, such as their tools. */
   taskHooks?: readonly HookRegistration[];
   refreshDelayMs?: number;
+  /** The session's collab directory. */
+  collab?: CollabBinding;
+  /** Sub-teams and broadcasts. */
+  teams?: Partial<TeamLimits>;
+  maxTokensPerMinute?: number;
 }
 
 /** What a test host opened for a service: the harness and its anchor. */
@@ -283,6 +289,11 @@ export function testExtensions(options: HostOptions = {}): AgentExtensions {
     ...(options.messaging ? { messaging: options.messaging } : {}),
     ...(options.maxWorkingAgents
       ? { maxWorkingAgents: options.maxWorkingAgents }
+      : {}),
+    ...(options.collab ? { collab: options.collab } : {}),
+    ...(options.teams ? { teams: options.teams } : {}),
+    ...(options.maxTokensPerMinute
+      ? { maxTokensPerMinute: options.maxTokensPerMinute }
       : {}),
   });
 }

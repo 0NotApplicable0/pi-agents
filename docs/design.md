@@ -53,6 +53,13 @@ adds no policy.
 - **Built-in policy isn't precedent.** Settings such as the working-agent
   cap don't justify adding more policy beside them.
 
+Teamwork belongs to the core too. Agents that share a job need a common
+memory and a way to avoid each other's edits as much as they need
+messages, and independent attempts need isolation that only the runtime
+can give. So every agent is in a collab group and competitions are part
+of pi-agents; see [Working together](./collab.md) and its
+[design](./collab-design.md).
+
 A request that fits none of this is out of scope, even when it is easy to
 build. Saying no keeps the core small enough to stay durable.
 
@@ -88,7 +95,9 @@ them.
 
 ## Composition
 
-One spawn starts one group of 1 to 12 agents and reports once to its owner.
+One spawn starts one group of 1 to 12 agents (a
+[setting](./configuration.md#spawning-limits) raises the limit) and reports
+once to its owner.
 The group owns that result; its graph describes only `after` dependencies
 within the group. A single tool covers single agents, fan-outs, and
 pipelines, so models don't choose between overlapping tools. A singleton
@@ -160,6 +169,20 @@ recipient may stay interrupted without the message.
 Messages between agents are visible to the user but don't start parent
 turns. Parent results and peer messages serve different audiences; see
 [messaging](./messaging.md) for delivery guarantees and limitations.
+
+## Working together
+
+Every agent is a member of a collab group, `main` unless its spawn names
+another, and an agent's helpers join its group. Members share a
+blackboard and advisory claims, files under the session's storage, and
+send structured messages (task and review requests, handoffs, and their
+answers) through the same delivery as `agent_send`. Group membership
+widens only `collab_send`'s reach, so graphs and `agent_send` keep their
+shape. A competition's solvers, judge, and merger are agents with a
+competition instead of a group: nobody reaches them, they reach nobody,
+and each solver works in its own worktree. Their results reach the
+workspace only when the user applies one. See
+[collab design](./collab-design.md).
 
 ## Delivery
 

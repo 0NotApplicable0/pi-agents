@@ -4,6 +4,11 @@ Give [Pi](https://pi.dev) durable, named agents. Delegate a job, keep working
 while the agent runs, and get its result back as a message. Watch any agent
 live, talk to it, or stop it. Agents survive crashes and restarts.
 
+Agents work as a team: they share a blackboard, claim files before they
+change them, and hand off work and ask each other for reviews. Or several
+agents solve the same task blind to each other, and you compare their
+solutions, merge the best, and apply the one you pick.
+
 > [!CAUTION]
 > Agents can't use MCP servers
 > ([earendil-works/pi#10837](https://github.com/earendil-works/pi/issues/10837))
@@ -59,6 +64,46 @@ one agent review each, and returns one merged review.
 Pi starts agents only when you ask for delegation. They work in the
 background and return their final messages to your conversation. In a
 graph, agents pass results to each other and Pi gets one message at the end.
+
+## 🤝 Working together
+
+The agents of a session are a team. Every agent is in the session's collab
+group: it shares a blackboard of findings, decisions, questions, and todos
+with the others, claims files before it changes them, and hands off work
+and asks for reviews with structured messages. Give agents roles, or a
+group of their own, and watch them with `/collab`.
+
+```text
+Spawn an implementer and a reviewer: the implementer adds input validation
+to src/api/routes.ts, posting decisions to the board and claiming the file
+first; the reviewer waits for a review request and answers it.
+```
+
+```text
+/collab              members, claims, open tasks, latest board entries
+/collab board        the whole blackboard
+/collab tasks        task_req/handoff/review_req and their answers
+```
+
+Or have several agents solve the same task independently, each in its own
+worktree, and compare their solutions, or merge the best of them. Nothing
+changes your workspace until you apply one:
+
+```text
+Run a competition with 3 solvers to fix the failing date parsing test;
+verify with "bun test tests/date.test.ts" and let a judge pick.
+```
+
+```text
+/compete show        the comparison table: verify result, diff size, confidence
+/compete compare     run verify again everywhere and show each solution
+/compete merge       an agent combines the two best into a new candidate
+/compete apply c1 c1-b
+/compete discard c1  remove the solvers' worktrees
+```
+
+See [Working together](docs/collab.md) and its
+[design](docs/collab-design.md).
 
 ## 🏗️ Architecture
 
@@ -117,3 +162,5 @@ Agents run inside Pi and use your Pi logins and models:
 - [Configuration](docs/configuration.md): models, requests, and footer counts.
 - [Architecture](docs/architecture.md): recovery, storage, and lifecycle events.
 - [Extension hooks](docs/hooks.md): capture settings, hold calls, and adapt requests.
+- [Working together](docs/collab.md): collab groups and competitions in one session.
+- [Collab design](docs/collab-design.md): how they work, and why.

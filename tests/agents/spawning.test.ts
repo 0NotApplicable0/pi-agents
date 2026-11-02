@@ -559,3 +559,65 @@ describe("spawning durability", () => {
     expect(second.prompts).toEqual(["hold b"]);
   });
 });
+
+describe("limits from settings", () => {
+  const many = (count: number, prefix = "h") =>
+    Array.from({ length: count }, (_, index) => ({
+      name: `${prefix}${index}`,
+      job: `job ${index}`,
+    }));
+
+  test("by default one call starts at most 12 agents", async () => {
+    const service = await open();
+    await expect(
+      service.spawnGraph({
+        agents: many(13).map((agent) => ({ ...agent, cwd: ".", model: MODEL })),
+      }),
+    ).rejects.toThrow("piAgents.maxAgentsPerSpawn");
+    await service.spawnGraph({ agents: [lead(spawnJob(many(13)))] });
+    expect(answerOf(await resultOf(service, "lead"))).toBe(
+      "final: One call starts at most 12 agents, not 13",
+    );
+  });
+
+  test("raised limits let the parent and a lead agent run teams of 100", async () => {
+    const { models } = scripted();
+    const service = await open({
+      models,
+      spawningLimits: { perCall: 100, perAgent: 100, active: 100 },
+    });
+    const team = await service.spawnGraph({
+      agents: many(100, "p").map((agent) => ({
+        ...agent,
+        cwd: ".",
+        model: MODEL,
+      })),
+    });
+    expect(team.nodes).toHaveLength(100);
+    await until(
+      () =>
+        many(100, "p").every(
+          (agent) => service.get(agent.name)?.state === "idle",
+        ),
+      30_000,
+    );
+    await service.spawnGraph({ agents: [lead(spawnJob(many(100), true))] });
+    const delivery = await resultOf(service, "lead");
+    expect(answerOf(delivery)).toStartWith("final:");
+    const [group] = spawnedGroups(service);
+    expect(group?.nodes).toHaveLength(100);
+    expect(
+      many(100).every((agent) =>
+        service.get(`lead.${agent.name}`)?.result?.text?.startsWith("done:"),
+      ),
+    ).toBe(true);
+  }, 60_000);
+
+  test("the depth limit comes from settings", async () => {
+    const service = await open({ spawningLimits: { depth: 1 } });
+    await service.spawnGraph({ agents: [lead(spawnJob(many(1)))] });
+    expect(answerOf(await resultOf(service, "lead"))).toBe(
+      "final: Agents at depth 1 can't spawn agents.",
+    );
+  });
+});
