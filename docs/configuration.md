@@ -70,7 +70,10 @@ budget:
 An agent's request then waits until the tokens of the last minute's
 requests, plus those still running, leave room for its own. A request's
 size is estimated from its context (characters / 4) until its response
-reports the real usage. A request larger than the whole budget runs alone.
+reports the real usage. A request estimated larger than the whole budget fails
+immediately. Aborting releases its outstanding estimate without charging unknown
+usage; a late response still accounts for actual usage. Stale reservations expire
+after 120 seconds. Compactions retain their estimated charge.
 Requests wait in order after an agent got its [working slot](#working-agents),
 and compactions count too. The budget is off by default, and `0` turns it
 off. It counts only this Pi session's agents, not your own requests or other
@@ -117,6 +120,47 @@ that a lead agent spawns and coordinates:
 
 Pi alone can start 100 agents in one call with just `maxAgentsPerSpawn`.
 See [agents that spawn agents](./graphs.md#agents-that-spawn-agents).
+
+## Verification environment
+
+The following `piAgents` settings are read **only from global settings**
+(`~/.pi/agent/settings.json`), when agents first open. Project settings cannot
+loosen this environment policy:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `verifyEnv` | `"scrub"` | `"scrub"`, `"minimal"`, or `"inherit"`. |
+| `verifyEnvPassthrough` | `[]` | Environment variable names explicitly allowed through any mode. |
+
+`"scrub"` removes names containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`KEY`, `CREDENTIAL`, `AUTH`, `COOKIE`, or `CONNECTION_STRING`/`CONNECTIONSTRING`
+(case-insensitively), plus `DATABASE_URL`, `SENTRY_DSN`, `REDIS_URL`, `GIT_*`,
+`BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `NODE_OPTIONS`, `LD_*`, and `DYLD_*`. It preserves ordinary environment
+variables, including PATH and HOME. This is best-effort name filtering, not
+comprehensive secret detection.
+`"minimal"` keeps PATH, HOME, USER, LOGNAME, SHELL, TMPDIR, TMP, TEMP, LANG,
+`LC_*`, SYSTEMROOT and WINDIR. `"inherit"` keeps the full environment.
+All modes force `CI=1` and `FORCE_COLOR=0`. Explicit passthrough names override
+filtering and may expose credentials; use sparingly. Invalid settings keep the
+safe defaults and report an error. Restart the session after changes.
+
+Model-requested verification additionally requires interactive UI approval;
+unconfirmed headless execution is refused. Explicit user `/compete` commands do
+not need this approval. No mode is a filesystem or network sandbox: HOME,
+credentials on disk and shared `node_modules` remain accessible.
+
+Approved verification runs again on every submit or verifying comparison, even
+when the command and diff hash are unchanged: ignored files and shared dependencies
+can affect the outcome. The last in-process result is retained only for display
+and ranking when verification is explicitly disabled, and is cleared on unseal.
+Saved results are historical, not authority to skip execution or award a passing
+verification score after restart.
+
+Resource, concurrency, token-budget and other existing settings intentionally
+continue to use Pi's **merged project settings**, including untrusted checkouts.
+A project can override global resource/cost limits. Review `.pi/settings.json`
+before using agents in an unfamiliar repository; environment policy does not
+protect against project-controlled spending or resource changes.
 
 ## Pi settings agents follow
 

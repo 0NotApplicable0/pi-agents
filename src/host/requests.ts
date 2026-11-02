@@ -12,7 +12,10 @@
  *   tokens of the last minute's requests, plus those in flight, leave room
  *   for its estimate (its context's characters / 4). A response replaces
  *   the estimate with the tokens its usage reports. A request larger than
- *   the whole budget runs alone.
+ *   the whole budget fails fast. Aborted or stale reservations release
+ *   their estimates; a late response still counts its actual usage.
+ *   Compaction estimates are capped at the budget so an oversized context
+ *   can still compact, admitted alone and charging one full budget.
  *
  * Both act in the hooks before generation requests and compactions, after
  * the working-agents cap admitted the agent. Requests that a restart
@@ -30,6 +33,7 @@ import {
 } from "@earendil-works/pi-durable";
 
 const WINDOW_MS = 60_000;
+const RESERVATION_LEASE_MS = 120_000;
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 
@@ -72,9 +76,15 @@ export function estimateTokens(messages: readonly unknown[]): number {
   return Math.ceil(chars / 4);
 }
 
-interface Waiter {
-  agentId: string;
+interface Reservation {
   estimate: number;
+  expiresAt: number;
+  cleanup: () => void;
+  settled: boolean;
+}
+
+interface Waiter {
+  reservation: Reservation;
   admit: () => void;
 }
 
@@ -91,8 +101,11 @@ export class ModelRequests {
   private readonly random: () => number;
   /** Tokens of requests that ended within the window. */
   private spent: Array<{ at: number; tokens: number }> = [];
-  /** Estimates of requests in flight, by agent. */
-  private readonly inflight = new Map<string, number>();
+  /** Each admission owns its reservation, independently of its conversation. */
+  private readonly inflight = new Set<Reservation>();
+  private readonly reservations = new Map<string, Reservation[]>();
+  /** Deferred responses run in a new phase runtime, but retain their task ID. */
+  private readonly generation = new Map<string, Reservation>();
   private readonly waiting: Waiter[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
   /** No request starts before this time. */
@@ -110,15 +123,23 @@ export class ModelRequests {
     this.hooks = [
       hook(GenerationTask, {
         beforeRequest: async (request, api, context) => {
-          await this.acquire(
-            String(api.conversationId),
+          const taskId = String(api.taskId);
+          const previous = this.generation.get(taskId);
+          // A prior attempt may have ended without reaching afterResponse.
+          if (previous) {
+            this.release(previous);
+            this.generation.delete(taskId);
+            this.pump();
+          }
+          const reservation = await this.reserve(
             this.tokensPerMinute ? estimateTokens(request.messages) : 0,
             context,
           );
+          this.generation.set(taskId, reservation);
           return undefined;
         },
         afterResponse: (message, api) => {
-          this.settle(String(api.conversationId), {
+          this.finish(this.generation.get(String(api.taskId)), {
             tokens:
               message.usage.totalTokens ||
               message.usage.input +
@@ -132,14 +153,19 @@ export class ModelRequests {
         },
       }),
       hook(CompactionTask, {
-        beforeCompact: async (compaction, api, context) => {
-          const agentId = String(api.conversationId);
+        beforeCompact: async (compaction, _api, context) => {
+          // Unlike generation, compaction must be able to shrink a context
+          // larger than the budget; cap its reservation and estimate charge.
           const estimate = this.tokensPerMinute
-            ? estimateTokens(compaction.messages)
+            ? Math.min(
+                estimateTokens(compaction.messages),
+                this.tokensPerMinute,
+              )
             : 0;
-          await this.acquire(agentId, estimate, context);
-          // The summary's usage reaches no hook: its estimate counts.
-          this.settle(agentId, { tokens: estimate });
+          const reservation = await this.reserve(estimate, context);
+          // The summary's usage reaches no hook: charge without declaring
+          // a provider success (which would reset rate-limit backoff).
+          this.finish(reservation, { tokens: estimate }, false);
           return undefined;
         },
       }),
@@ -156,7 +182,7 @@ export class ModelRequests {
     this.expire();
     let total = 0;
     for (const each of this.spent) total += each.tokens;
-    for (const estimate of this.inflight.values()) total += estimate;
+    for (const reservation of this.inflight) total += reservation.estimate;
     return total;
   }
 
@@ -165,21 +191,41 @@ export class ModelRequests {
     return this.pausedUntil > this.now() ? this.pausedUntil : 0;
   }
 
-  acquire(agentId: string, estimate: number, context: Context): Promise<void> {
+  async acquire(
+    agentId: string,
+    estimate: number,
+    context: Context,
+  ): Promise<void> {
+    const reservation = await this.reserve(estimate, context);
+    const pending = this.reservations.get(agentId) ?? [];
+    pending.push(reservation);
+    this.reservations.set(agentId, pending);
+  }
+
+  private reserve(estimate: number, context: Context): Promise<Reservation> {
     const signal = context.abortSignal;
     signal?.throwIfAborted();
+    if (this.tokensPerMinute !== undefined && estimate > this.tokensPerMinute)
+      return Promise.reject(
+        new Error(
+          `Request estimate ${estimate} exceeds token budget ${this.tokensPerMinute}`,
+        ),
+      );
     return new Promise((resolve, reject) => {
-      const waiter: Waiter = {
-        agentId,
+      const reservation: Reservation = {
         estimate,
-        admit: () => {
-          signal?.removeEventListener("abort", onAbort);
-          resolve();
-        },
+        expiresAt: 0,
+        cleanup: () => signal?.removeEventListener("abort", onAbort),
+        settled: false,
+      };
+      const waiter: Waiter = {
+        reservation,
+        admit: () => resolve(reservation),
       };
       const onAbort = () => {
         const index = this.waiting.indexOf(waiter);
         if (index >= 0) this.waiting.splice(index, 1);
+        this.release(reservation);
         reject(signal?.reason);
         this.pump();
       };
@@ -189,10 +235,30 @@ export class ModelRequests {
     });
   }
 
+  private release(reservation: Reservation): void {
+    this.inflight.delete(reservation);
+    reservation.cleanup();
+  }
+
   /** A request ended: its usage replaces its estimate, and a rate limit
    * pauses every request. */
   settle(agentId: string, outcome: { tokens: number; error?: string }): void {
-    this.inflight.delete(agentId);
+    const pending = this.reservations.get(agentId);
+    const reservation = pending?.shift();
+    if (pending?.length === 0) this.reservations.delete(agentId);
+    this.finish(reservation, outcome);
+  }
+
+  private finish(
+    reservation: Reservation | undefined,
+    outcome: { tokens: number; error?: string },
+    response = true,
+  ): void {
+    if (reservation) {
+      if (reservation.settled) return;
+      reservation.settled = true;
+      this.release(reservation);
+    }
     const now = this.now();
     if (outcome.tokens > 0)
       this.spent.push({ at: now, tokens: outcome.tokens });
@@ -207,12 +273,19 @@ export class ModelRequests {
         Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** (this.strikes - 1)) *
           (1 - this.random() * 0.25);
       this.pausedUntil = Math.max(this.pausedUntil, now + delay);
-    } else if (!outcome.error) this.strikes = 0;
+    } else if (response && !outcome.error) this.strikes = 0;
     this.pump();
   }
 
   private expire(): void {
-    const from = this.now() - WINDOW_MS;
+    const now = this.now();
+    for (const reservation of this.inflight)
+      if (reservation.expiresAt <= now) this.release(reservation);
+    // Bound correlation records too. Responses beyond the lease still charge
+    // usage through finish(undefined), without touching another reservation.
+    for (const [taskId, reservation] of this.generation)
+      if (reservation.expiresAt <= now) this.generation.delete(taskId);
+    const from = now - WINDOW_MS;
     let drop = 0;
     while (drop < this.spent.length && (this.spent[drop]?.at ?? 0) <= from)
       drop += 1;
@@ -222,6 +295,7 @@ export class ModelRequests {
   /** Admit waiting requests in order while the budget has room; then wait
    * for the backoff's end or the window's oldest tokens to leave. */
   private pump(): void {
+    this.expire();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
@@ -233,20 +307,19 @@ export class ModelRequests {
       while (this.waiting.length > 0) {
         const next = this.waiting[0] as Waiter;
         const budget = this.tokensPerMinute;
-        if (budget !== undefined && next.estimate > 0) {
+        if (budget !== undefined && next.reservation.estimate > 0) {
           const used = this.used();
-          if (used > 0 && used + next.estimate > budget) {
-            // Room comes as the oldest spent tokens leave the window; with
-            // only requests in flight, their responses pump again.
+          if (used + next.reservation.estimate > budget) {
             const oldest = this.spent[0];
-            wake = oldest ? oldest.at + WINDOW_MS + 1 : undefined;
+            wake = oldest ? oldest.at + WINDOW_MS : undefined;
+            for (const reservation of this.inflight)
+              wake = Math.min(wake ?? Infinity, reservation.expiresAt);
             break;
           }
         }
         this.waiting.shift();
-        // One request of an agent is in flight at a time: a new one
-        // replaces an estimate whose request ended unseen (aborted).
-        if (next.estimate > 0) this.inflight.set(next.agentId, next.estimate);
+        next.reservation.expiresAt = now + RESERVATION_LEASE_MS;
+        this.inflight.add(next.reservation);
         next.admit();
       }
     if (wake !== undefined && this.waiting.length > 0) {

@@ -422,6 +422,37 @@ export function messageInput(from: string, text: string): string {
 
 export class AgentError extends Error {}
 
+/** A committed graph whose projection could not be read back. */
+export class GraphStartedError extends AgentError {
+  constructor(
+    readonly graphId: string,
+    readonly agents: readonly string[],
+    cause: unknown,
+  ) {
+    super(
+      `Started graph ${graphId}, but reading it back failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.cause = cause;
+  }
+}
+
+/** A parent's competition agent, identified by its durable membership. */
+export interface CompetitionOwner {
+  agentId: string;
+  graph: string;
+  part?: "solver" | "judge";
+  solver?: string;
+  bracket?: number;
+  stopped: boolean;
+}
+
+export interface CompetitionOwnership {
+  /** All owners, including agents whose graphs also contain other work. */
+  agents: CompetitionOwner[];
+  /** Only graphs whose nodes all belong to this competition. */
+  graphs: Array<{ id: string; closed: boolean }>;
+}
+
 /** A wait that ended before its agents answered: its caller cancelled it,
  * or something needs the parent, such as the user steering. */
 export class WaitInterrupted extends AgentError {

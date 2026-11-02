@@ -27,6 +27,61 @@ export function readPositiveInteger(
   return { value };
 }
 
+/** Verification environment policy, read from global settings only. */
+export function readVerifySettings(settings: unknown): {
+  mode: "scrub" | "minimal" | "inherit";
+  passthrough: string[];
+  errors: string[];
+} {
+  const result: ReturnType<typeof readVerifySettings> = {
+    mode: "scrub",
+    passthrough: [],
+    errors: [],
+  };
+  const section =
+    typeof settings === "object" && settings !== null
+      ? (settings as Record<string, unknown>)[SETTINGS_KEY]
+      : undefined;
+  if (section === undefined) return result;
+  if (
+    typeof section !== "object" ||
+    section === null ||
+    Array.isArray(section)
+  ) {
+    result.errors.push(`${SETTINGS_KEY} must be an object`);
+    return result;
+  }
+  const { verifyEnv, verifyEnvPassthrough } = section as Record<
+    string,
+    unknown
+  >;
+  if (
+    verifyEnv === "scrub" ||
+    verifyEnv === "minimal" ||
+    verifyEnv === "inherit"
+  )
+    result.mode = verifyEnv;
+  else if (verifyEnv !== undefined)
+    result.errors.push(
+      `${SETTINGS_KEY}.verifyEnv must be scrub, minimal, or inherit`,
+    );
+  if (verifyEnvPassthrough !== undefined) {
+    if (
+      Array.isArray(verifyEnvPassthrough) &&
+      verifyEnvPassthrough.every(
+        (name) =>
+          typeof name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name),
+      )
+    )
+      result.passthrough = [...new Set(verifyEnvPassthrough as string[])];
+    else
+      result.errors.push(
+        `${SETTINGS_KEY}.verifyEnvPassthrough must be an array of environment variable names`,
+      );
+  }
+  return result;
+}
+
 /** How far agents reach, from `piAgents` settings over these defaults. */
 export interface Limits {
   /** Agents one spawn starts, yours or an agent's. */

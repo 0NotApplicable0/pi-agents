@@ -304,7 +304,7 @@ describe("competitions", () => {
 
     // Only an explicit apply changes the main workspace, with the chosen
     // candidate's change alone.
-    const applied = competitions.apply(service, "c1", "c1-m1");
+    const applied = await competitions.apply(service, "c1", "c1-m1");
     expect(applied.ok).toBe(true);
     expect(fs.readFileSync(path.join(repo, "sum.js"), "utf8")).toBe(
       `${SOLUTIONS["c1-a"]}// merged: c1-a with c1-b\n`,
@@ -423,7 +423,7 @@ describe("competitions", () => {
     expect(fs.readFileSync(path.join(dir, "sum.js"), "utf8")).toBe(
       "module.exports = () => 0;\n",
     );
-    const applied = competitions.apply(service, competition.id, "c1-m1");
+    const applied = await competitions.apply(service, competition.id, "c1-m1");
     expect(applied.ok).toBe(true);
     expect(fs.readFileSync(path.join(dir, "sum.js"), "utf8")).toBe(
       `${SOLUTIONS["c1-a"]}// merged: c1-a with c1-b\n`,

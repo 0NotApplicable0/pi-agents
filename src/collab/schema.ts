@@ -148,7 +148,7 @@ export const claimParameters = Type.Object({
   resources: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        'Paths relative to your working directory (a directory claims everything under it), "item:<board id>", or "key:<anything>"',
+        'Absolute paths or paths relative to your working directory (including ..; a directory claims its descendants), "item:<board id>", or "key:<anything>". Paths identify canonical real files across working directories; separate worktrees are independent',
     }),
   ),
   note: Type.Optional(Type.String({ description: "What you're doing" })),

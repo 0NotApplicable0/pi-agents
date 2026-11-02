@@ -37,9 +37,11 @@ import {
   compare,
   comparisonDetails,
   comparisonTable,
+  competitionSeal,
   finalists,
   readCompetition,
   type SolverEntry,
+  verificationSnapshot,
   verifyLabel,
   verifySolver,
   writeSubmission,
@@ -579,7 +581,7 @@ export function createCollabExtension(
       defineTool({
         name: COLLAB_CLAIM_TOOL,
         description:
-          "Claim work (paths relative to your working directory, item:<board id>, or key:<text>) before you change it so other members avoid it; see others' claims; release yours when done. Advisory.",
+          "Claim work (absolute or cwd-relative paths, item:<board id>, or key:<text>) before you change it so other members avoid it; see others' claims; release yours when done. Paths use canonical real-file identity across working directories; separate worktrees are independent. Advisory.",
         parameters: claimParameters,
         replay: "safe",
         async execute(args, api, context) {
@@ -743,22 +745,27 @@ export function solverStates(
 ): Record<string, string> {
   return Object.fromEntries(
     competition.solvers.map((entry) => {
-      const record = entry.agentId ? agents[entry.agentId] : undefined;
-      const value = !record
+      const member = Object.entries(agents).find(
+        ([, record]) =>
+          record.collab?.competition === competition.id &&
+          record.collab.part === "solver" &&
+          record.collab.solver === entry.name,
+      );
+      const value = !member
         ? "unknown"
-        : record.stopped
+        : member[1].stopped
           ? "stopped"
-          : (state(entry.agentId as string) ?? "idle");
+          : (state(member[0]) ?? "idle");
       return [entry.name, value];
     }),
   );
 }
 
 function solverEntry(contestant: Contestant): SolverEntry | undefined {
-  const { competition, membership, agentId } = contestant;
-  return competition.solvers.find(
-    (entry) => entry.name === membership.solver || entry.agentId === agentId,
-  );
+  const { competition, membership } = contestant;
+  if (membership.competition !== competition.id || membership.part !== "solver")
+    return undefined;
+  return competition.solvers.find((entry) => entry.name === membership.solver);
 }
 
 /** The tools of a competition's solvers and judge. */
@@ -782,7 +789,7 @@ export function createCompeteExtension(
       defineTool({
         name: COMPETE_SUBMIT_TOOL,
         description:
-          "Submit your solution to the competition: your summary, approach, tests, confidence, and caveats. The tool takes your workspace's diff and runs the verify command, and returns both; submit again after a fix, the last submission counts.",
+          "Submit your solution to the competition: your summary, approach, tests, confidence, and caveats. The tool takes your workspace's diff and runs the verify command only when approved in this session process, and returns both; submit again after a fix, the last submission counts.",
         parameters: submitParameters,
         replay: "safe",
         async execute(args, api, context) {
@@ -807,12 +814,19 @@ export function createCompeteExtension(
               true,
             );
           try {
+            // Only a process-local seal grants autonomous verification. A
+            // restored record must wait for approval through Pi, not this tool.
+            const approval = competitionSeal(binding.root(), competition.id)
+              ? verificationSnapshot(binding.root(), competition)
+              : undefined;
             const diff = collectDiff(entry);
             const verify = await verifySolver(
               binding.root(),
               competition,
               entry,
               diff,
+              context.abortSignal,
+              approval,
             );
             const at = await api.memo<number>("compete-at", api.now(), context);
             writeSubmission(binding.root(), competition.id, {
@@ -825,7 +839,7 @@ export function createCompeteExtension(
               submittedAt: at,
               files: diff.files,
               hash: diff.hash,
-              ...(verify ? { verify } : {}),
+              ...(verify && !verify.skipped ? { verify } : {}),
             });
             const files = diff.files.length
               ? diff.files
@@ -834,9 +848,11 @@ export function createCompeteExtension(
                   )
                   .join(", ")
               : "none: your workspace has no changes";
-            const verdict = verify
-              ? `Verify \`${verify.command}\`: ${verifyLabel(verify)}.${verify.exitCode === 0 && !verify.timedOut ? "" : `\n${verify.output.slice(-2_000).trim()}\nFix the failure and submit again.`}`
-              : "No verify command.";
+            const verdict = verify?.skipped
+              ? "Verification skipped/unapproved: the saved verify command is not approved in this session process."
+              : verify
+                ? `Verify \`${verify.command}\`: ${verifyLabel(verify)}.${verify.exitCode === 0 && !verify.timedOut ? "" : `\n${verify.output.slice(-2_000).trim()}\nFix the failure and submit again.`}`
+                : "No verify command.";
             return textResult(
               `Submitted ${entry.name}'s solution. Files: ${files}.\n${verdict}`,
             );
@@ -857,6 +873,9 @@ export function createCompeteExtension(
             return textResult(contestant, true);
           try {
             const { competition, membership } = contestant;
+            const approval = competitionSeal(binding.root(), competition.id)
+              ? verificationSnapshot(binding.root(), competition)
+              : undefined;
             // A bracket judge compares its bracket; the final judge the
             // brackets' finalists.
             const solvers =
@@ -871,10 +890,17 @@ export function createCompeteExtension(
               solverStates(competition, contestant.agents, (id) =>
                 hub.state(id),
               ),
-              solvers ? { solvers } : {},
+              {
+                ...(solvers ? { solvers } : {}),
+                ...(approval ? { approval } : {}),
+                signal: context.abortSignal,
+              },
             );
+            const skipped = comparison.rows.some((row) => row.verify?.skipped)
+              ? "Verification skipped/unapproved: the saved verify command is not approved in this session process.\n\n"
+              : "";
             return textResult(
-              `${comparisonTable(comparison)}\n\n${comparisonDetails(comparison)}`,
+              `${skipped}${comparisonTable(comparison)}\n\n${comparisonDetails(comparison)}`,
             );
           } catch (error) {
             return textResult(errorText(error), true);

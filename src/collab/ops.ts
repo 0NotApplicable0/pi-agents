@@ -7,6 +7,7 @@
  * which the store ignores.
  */
 
+import * as path from "node:path";
 import {
   BOARD_KINDS,
   BOARD_STATUSES,
@@ -16,6 +17,7 @@ import {
   type Claim,
   type CollabMessage,
   type CollabStore,
+  canonicalPath,
   FINISHED_STATUSES,
   type MemberRecord,
   normalizeResource,
@@ -236,11 +238,20 @@ export interface ClaimArgs {
   ttlMinutes?: number;
 }
 
+function resourceLabel(resource: string, cwd?: string): string {
+  if (!cwd || !resource.startsWith("path:")) return resource;
+  return `path:${path.relative(canonicalPath("", cwd), resource.slice(5)) || "."}`;
+}
+
 export function claimLine(claim: Claim): string {
+  return formatClaim(claim);
+}
+
+function formatClaim(claim: Claim, cwd?: string): string {
   const expires = claim.expiresAt
     ? ` expires in ${Math.max(0, Math.round((claim.expiresAt - Date.now()) / 60000))}m`
     : "";
-  return `${claim.resource} held by ${claim.ownerName} since ${ago(claim.claimedAt)}${claim.note ? ` (${claim.note})` : ""}${expires}`;
+  return `${resourceLabel(claim.resource, cwd)} held by ${claim.ownerName} since ${ago(claim.claimedAt)}${claim.note ? ` (${claim.note})` : ""}${expires}`;
 }
 
 export function claims(
@@ -254,7 +265,7 @@ export function claims(
       text:
         held.length === 0
           ? `No claims in ${store.group}.`
-          : held.map(claimLine).join("\n"),
+          : held.map((claim) => formatClaim(claim, self?.cwd)).join("\n"),
       data: { claims: held },
     };
   }
@@ -277,7 +288,7 @@ export function claims(
       text:
         released.length === 0
           ? "You held none of these claims."
-          : `Released ${released.map((claim) => claim.resource).join(", ")}.`,
+          : `Released ${released.map((claim) => resourceLabel(claim.resource, self.cwd)).join(", ")}.`,
       data: { claims: released },
     };
   }
@@ -293,12 +304,12 @@ export function claims(
   });
   if (!outcome.ok)
     return {
-      text: `Not claimed; these overlap others' claims:\n${outcome.conflicts.map(claimLine).join("\n")}\nCoordinate with the holders (collab_send) or pick other work.`,
+      text: `Not claimed; these overlap others' claims:\n${outcome.conflicts.map((claim) => formatClaim(claim, self.cwd)).join("\n")}\nCoordinate with the holders (collab_send) or pick other work.`,
       data: { claims: [], conflicts: outcome.conflicts },
       error: true,
     };
   return {
-    text: `Claimed ${outcome.claims.map((claim) => claim.resource).join(", ")}. Release them with collab_claim action "release" when done.`,
+    text: `Claimed ${outcome.claims.map((claim) => resourceLabel(claim.resource, self.cwd)).join(", ")}. Release them with collab_claim action "release" when done.`,
     data: { claims: outcome.claims },
   };
 }
@@ -318,11 +329,13 @@ export function messageLine(message: CollabMessage): string {
  * latest messages. */
 export function overview(
   store: CollabStore,
-  options: { messages?: number } = {},
+  options: { messages?: number; cwd?: string } = {},
 ): string {
   const members = store.members();
   const held = store.claims();
-  const tasks = store.tasks().filter((task) => !isClosedTask(task));
+  const tasks = store
+    .tasks()
+    .filter((task) => task.requester !== "" && !isClosedTask(task));
   const entries = store.summaries({ limit: 10 });
   const counts = boardCountsLine(store);
   const messages = store.messages(options.messages ?? 10);
@@ -331,7 +344,10 @@ export function overview(
   return [
     `Collab group ${store.group}  (${store.dir})`,
     section("Members", members.map(memberLine)),
-    section("Claims", held.map(claimLine)),
+    section(
+      "Claims",
+      held.map((claim) => formatClaim(claim, options.cwd)),
+    ),
     section("Open tasks", tasks.map(taskLine)),
     section("Blackboard", counts ? [counts, ...entries.map(entryLine)] : []),
     section("Recent messages", messages.map(messageLine)),

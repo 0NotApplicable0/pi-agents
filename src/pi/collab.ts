@@ -8,7 +8,8 @@
  *   members, claims, tasks, blackboard, and messages.
  * - `CollabMonitor`: marks stopped members exited, which releases their
  *   claims, and stops solvers that outlive their competition's deadline.
- *   It keeps no state of its own, so it picks up after a restart.
+ *   Durable membership restores monitoring after a restart; successful deadline
+ *   stops are remembered for this service's lifetime so users can resume solvers.
  */
 
 import fs from "node:fs";
@@ -23,24 +24,34 @@ import type { AgentService } from "../agents/service.js";
 import { errorText } from "../agents/spawn-support.js";
 import {
   AgentError,
+  type CompetitionOwner,
+  type CompetitionOwnership,
+  GraphStartedError,
   type SpawnSpec,
   THINKING_LEVELS,
 } from "../agents/types.js";
 import {
   applySolution,
+  approveCompetitionVerification,
+  assertBound,
+  assertCompetitionId,
+  assertProjectCwd,
   bracketJudgeJob,
   bracketsOf,
   COMPETE_TIMEOUT_MS,
   type Competition,
+  type CompetitionState,
   collectDiff,
   compare,
   comparisonDetails,
   comparisonTable,
+  competitionDir,
   DEFAULT_HINTS,
   detectVerify,
   discardWorkspaces,
+  inspectCompetition,
   judgeJob,
-  listCompetitions,
+  listCompetitionStates,
   mergeJob,
   prepareMergeWorkspace,
   prepareWorkspaces,
@@ -49,15 +60,25 @@ import {
   readVerdict,
   reserveCompetitionId,
   SOLVER_COUNT,
+  SOLVER_NAME,
   type SolverEntry,
   type SolverPlan,
+  sealCompetition,
   solverJob,
+  unsealCompetition,
   updateCompetition,
   VERIFY_TIMEOUT_MS,
+  type VerifyApproval,
+  verificationSnapshot,
   writeCompetition,
   writeSourcePatches,
 } from "../collab/compete.js";
-import { collabKey, collabStore, listGroups } from "../collab/membership.js";
+import {
+  collabKey,
+  collabStore,
+  listGroups,
+  resolveCollab,
+} from "../collab/membership.js";
 import {
   claimLine,
   entryLine,
@@ -84,6 +105,8 @@ export interface CompeteRequest {
   judgeModel?: string;
   timeoutMinutes?: number;
   cwd: string;
+  /** The current parent project; restricts fresh workspace bindings. */
+  project?: string;
 }
 
 /** What merging solutions asks for. */
@@ -94,6 +117,9 @@ export interface MergeRequest {
   model?: string;
   thinking?: string;
   timeoutMinutes?: number;
+  project?: string;
+  approval?: VerifyApproval;
+  authorized?: boolean;
 }
 
 /** Resolve one agent of a competition into a spawn: the Pi tool resolves
@@ -121,11 +147,27 @@ function solverPlans(
   return Array.from({ length: count }, (_, index) => {
     const variant = request.variants?.[index] ?? {};
     let name =
-      variant.name?.trim().replace(/[^A-Za-z0-9._-]/g, "-") ||
+      variant.name?.trim().replace(/[^A-Za-z0-9_-]/g, "-") ||
       (index < 26
         ? `${id}-${String.fromCharCode(97 + index)}`
         : `${id}-${index + 1}`);
-    if (names.has(name)) name = `${name}-${index + 1}`;
+    if (
+      !SOLVER_NAME.test(name) ||
+      name === `${id}-judge` ||
+      name.startsWith(`${id}-judge-`) ||
+      new RegExp(`^${id}-m\\d+$`).test(name)
+    )
+      throw new AgentError(
+        `Invalid or reserved solver name ${JSON.stringify(name)}`,
+      );
+    const base = name;
+    let suffix = index + 1;
+    while (names.has(name)) {
+      const ending = `-${suffix++}`;
+      name = `${base.slice(0, 64 - ending.length)}${ending}`;
+    }
+    if (!SOLVER_NAME.test(name))
+      throw new AgentError(`Invalid solver name ${JSON.stringify(name)}`);
     names.add(name);
     // Every solver gets a different default strategy; a given hint
     // replaces it, and an empty one means none.
@@ -141,25 +183,36 @@ function solverPlans(
   });
 }
 
-/** A solver's state as the service sees it. */
-function stateOf(service: AgentService, entry: SolverEntry): string {
-  if (!entry.agentId) return "unknown";
-  const info = service.agentById(entry.agentId);
-  if (!info) return "unknown";
-  if (service.isStopped(entry.agentId)) return "stopped";
-  return info.state;
+/** Missing projections must not make durable, unfinished owners look idle. */
+function stateOf(service: AgentService, owner: CompetitionOwner): string {
+  if (owner.stopped) return "stopped";
+  return service.agentById(owner.agentId)?.state ?? "working";
 }
 
 function statesOf(
   service: AgentService,
   competition: Competition,
+  ownership: CompetitionOwnership | undefined,
 ): Record<string, string> {
   return Object.fromEntries(
-    competition.solvers.map((entry) => [entry.name, stateOf(service, entry)]),
+    competition.solvers.map((entry) => {
+      const owners =
+        ownership?.agents.filter(
+          (owner) => owner.part === "solver" && owner.solver === entry.name,
+        ) ?? [];
+      const states = owners.map((owner) => stateOf(service, owner));
+      return [
+        entry.name,
+        states.find((state) => ACTIVE.has(state)) ?? states[0] ?? "unknown",
+      ];
+    }),
   );
 }
 
 const ACTIVE = new Set(["working", "waiting"]);
+// Persisted timedOut names are diagnostic, not authority to skip a first stop.
+// Keep successful stops across monitor/Competitions recreation, but not services.
+const expiredSolvers = new WeakMap<AgentService, Set<string>>();
 
 /** Competitions of one session: what `agent_compete` and `/compete` do. */
 export class Competitions {
@@ -186,17 +239,112 @@ export class Competitions {
   /** A competition by ID, or the newest. */
   find(id?: string): Competition {
     const root = this.requireRoot();
-    const competition = id
-      ? readCompetition(root, id)
-      : listCompetitions(root)[0];
+    if (id !== undefined) assertCompetitionId(id);
+    const selected = id ?? listCompetitionStates(root)[0]?.competition.id;
+    const competition = selected ? readCompetition(root, selected) : undefined;
     if (!competition)
       throw new AgentError(id ? `No competition ${id}` : "No competitions yet");
     return competition;
   }
 
+  inspect(id?: string): CompetitionState {
+    const root = this.requireRoot();
+    if (id !== undefined) assertCompetitionId(id);
+    const state = id
+      ? inspectCompetition(root, id)
+      : listCompetitionStates(root)[0];
+    if (!state)
+      throw new AgentError(id ? `No competition ${id}` : "No competitions yet");
+    return state;
+  }
+
   list(): Competition[] {
     const root = this.root();
-    return root ? listCompetitions(root) : [];
+    return root
+      ? listCompetitionStates(root).map((state) => state.competition)
+      : [];
+  }
+
+  snapshot(competition: Competition): VerifyApproval | undefined {
+    return verificationSnapshot(this.requireRoot(), competition);
+  }
+
+  /** Stop only durable owners. Mixed graphs are handled agent by agent. */
+  private async stopOwners(
+    service: AgentService,
+    ownership: CompetitionOwnership | undefined,
+    solver?: string,
+  ): Promise<void> {
+    const agents =
+      ownership?.agents.filter(
+        (owner) => solver === undefined || owner.solver === solver,
+      ) ?? [];
+    const graphs =
+      ownership?.graphs.filter(
+        (graph) =>
+          solver === undefined ||
+          ownership.agents.every(
+            (owner) => owner.graph !== graph.id || owner.solver === solver,
+          ),
+      ) ?? [];
+    const stopped = new Set<string>();
+    for (const graph of graphs) {
+      // Closed graphs can still have owners needing cleanup after a failed refresh.
+      if (
+        graph.closed &&
+        !agents.some((owner) => owner.graph === graph.id && !owner.stopped)
+      )
+        continue;
+      await service.stopTarget({ kind: "graph", id: graph.id });
+      stopped.add(graph.id);
+    }
+    for (const owner of agents)
+      if (!owner.stopped && !stopped.has(owner.graph))
+        await service.stopTarget({ kind: "agent", id: owner.agentId });
+  }
+
+  /** Even an untyped spawn failure can follow a durable commit. Reconcile before
+   * deleting anything; diagnostic markers never authorize stopping a target. */
+  private async stopFailedSpawn(
+    root: string,
+    service: AgentService,
+    competition: Competition,
+    graph: string | undefined,
+    owner: string,
+    failure: unknown,
+    solver?: string,
+  ): Promise<void> {
+    try {
+      const ownership = (await service.competitionOwners()).get(competition.id);
+      if (
+        graph &&
+        !ownership?.graphs.some((each) => each.id === graph) &&
+        !ownership?.agents.some((each) => each.graph === graph)
+      )
+        throw new AgentError(
+          `Committed graph ${graph} has no durable competition ownership`,
+        );
+      await this.stopOwners(service, ownership, solver);
+    } catch (stopError) {
+      let recovery = "Ownership metadata could not be saved.";
+      try {
+        // Diagnostic only, never authority for verification or project binding.
+        // Exclusive creation refuses a pre-existing file or symlink.
+        const file = path.join(
+          competitionDir(root, competition.id),
+          `orphan-${owner}.json`,
+        );
+        fs.writeFileSync(
+          file,
+          JSON.stringify({ graph, competition }, null, 2),
+          { flag: "wx", mode: 0o600 },
+        );
+        recovery = `Recovery ownership: ${file}.`;
+      } catch {}
+      throw new AgentError(
+        `${errorText(failure)}; reconciling/stopping owners${graph ? ` of graph ${graph}` : ""} failed: ${errorText(stopError)}. Competition ${competition.id} workspaces were preserved: ${competition.solvers.map((entry) => entry.workspace).join(", ")}. ${recovery} Resolve durable ownership before removing its workspaces.`,
+      );
+    }
   }
 
   /** Create the workspaces and start the solvers and judge as one graph,
@@ -209,8 +357,11 @@ export class Competitions {
   ): Promise<Competition> {
     const root = this.requireRoot();
     if (!request.task.trim()) throw new AgentError("Name the task to solve");
+    if (request.project) assertProjectCwd(request.cwd, request.project);
     const id = reserveCompetitionId(root);
     let competition: Competition | undefined;
+    let started: string | undefined;
+    let spawning = false;
     try {
       const plans = solverPlans(request, id, this.maxSolvers());
       const given = request.verify?.trim();
@@ -224,6 +375,7 @@ export class Competitions {
         collabRoot: root,
         id,
         cwd: request.cwd,
+        project: request.project,
         solvers: plans.map((plan) => plan.name),
       });
       const createdAt = Date.now();
@@ -237,7 +389,7 @@ export class Competitions {
           (request.timeoutMinutes
             ? request.timeoutMinutes * 60_000
             : COMPETE_TIMEOUT_MS),
-        cwd: path.resolve(request.cwd),
+        cwd: workspaces.cwd,
         root: workspaces.root,
         git: workspaces.git,
         ...(verify ? { verify } : {}),
@@ -272,6 +424,8 @@ export class Competitions {
             solvers,
           }));
       }
+      assertBound(root, competition, request.project);
+      sealCompetition(root, competition);
       writeCompetition(root, competition);
       const current = competition;
       const solvers = await Promise.all(
@@ -339,15 +493,17 @@ export class Competitions {
       );
       if (judge && bracketJudges.length > 0)
         judge.after = (current.brackets ?? []).map((each) => each.judge);
+      spawning = true;
       const graph = await service.spawnGraph({
         name: `compete-${id}`,
         agents: [...solvers, ...bracketJudges, ...(judge ? [judge] : [])],
         maxAgents: plans.length + bracketJudges.length + 1,
       });
+      started = graph.id;
       const byName = new Map(
         graph.nodes.map((node) => [node.name, node.agentId]),
       );
-      competition = updateCompetition(root, id, (record) => ({
+      const own = (record: Competition): Competition => ({
         ...record,
         graph: graph.id,
         solvers: record.solvers.map((entry) => ({
@@ -376,13 +532,28 @@ export class Competitions {
               },
             }
           : {}),
-      }));
+      });
+      competition = own(current);
+      competition = updateCompetition(root, id, own);
       return competition;
     } catch (error) {
-      // Nothing started: leave no worktrees behind.
+      if (spawning && competition)
+        await this.stopFailedSpawn(
+          root,
+          service,
+          competition,
+          error instanceof GraphStartedError ? error.graphId : started,
+          "start",
+          error,
+        );
       if (competition) {
-        discardWorkspaces(competition);
-        writeCompetition(root, { ...competition, status: "discarded" });
+        discardWorkspaces(root, competition);
+        unsealCompetition(root, id);
+        try {
+          writeCompetition(root, { ...competition, status: "discarded" });
+        } catch {
+          // The original persistence failure remains the actionable error.
+        }
       } else
         fs.rmSync(path.join(root, "competitions", id), {
           recursive: true,
@@ -392,24 +563,41 @@ export class Competitions {
     }
   }
 
-  /** The comparison table; with `verify`, verify runs where its result
-   * isn't cached, and the details follow. */
+  /** The comparison table; with `verify`, verify runs afresh and the details
+   * follow. */
   async report(
     service: AgentService,
     id: string | undefined,
-    options: { verify?: boolean; details?: boolean; signal?: AbortSignal } = {},
+    options: {
+      verify?: boolean;
+      details?: boolean;
+      signal?: AbortSignal;
+      approval?: VerifyApproval;
+      authorized?: boolean;
+      project?: string;
+    } = {},
   ): Promise<string> {
-    const competition = this.find(id);
-    const comparison = await compare(
-      this.requireRoot(),
-      competition,
-      statesOf(service, competition),
-      {
-        verify: options.verify === true,
-        ...(options.signal ? { signal: options.signal } : {}),
-      },
-    );
-    const states = statesOf(service, competition);
+    const root = this.requireRoot();
+    const { competition, unsafe } = this.inspect(id);
+    if (unsafe.length) {
+      const message = `Competition ${competition.id} (${competition.status}): unsafe paths refused: ${unsafe.join(", ")}. Status and discard remain available; comparison and verification are disabled.`;
+      if (options.verify) throw new AgentError(message);
+      return message;
+    }
+    if (options.authorized)
+      approveCompetitionVerification(
+        root,
+        competition,
+        options.approval,
+        options.project,
+      );
+    const ownership = (await service.competitionOwners()).get(competition.id);
+    const states = statesOf(service, competition, ownership);
+    const comparison = await compare(this.requireRoot(), competition, states, {
+      verify: options.verify === true,
+      ...(options.approval ? { approval: options.approval } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
     const working = competition.solvers.filter((entry) =>
       ACTIVE.has(states[entry.name] ?? ""),
     );
@@ -417,8 +605,11 @@ export class Competitions {
       Math.min(
         ...working.map((entry) => entry.deadline ?? competition.deadline),
       ) - Date.now();
-    const judge = competition.judge?.agentId
-      ? service.agentById(competition.judge.agentId)
+    const judgeOwner = ownership?.agents.find(
+      (owner) => owner.part === "judge" && owner.bracket === undefined,
+    );
+    const judge = judgeOwner
+      ? service.agentById(judgeOwner.agentId)
       : undefined;
     const lines = [
       comparisonTable(comparison),
@@ -426,8 +617,11 @@ export class Competitions {
         ? [
             `Bracket judges: ${competition.brackets
               .map((bracket, index) => {
-                const agent = bracket.agentId
-                  ? service.agentById(bracket.agentId)
+                const owner = ownership?.agents.find(
+                  (owner) => owner.part === "judge" && owner.bracket === index,
+                );
+                const agent = owner
+                  ? service.agentById(owner.agentId)
                   : undefined;
                 return `${index + 1} ${bracket.judge} ${agent?.state ?? "pending"} (${bracket.solvers.join(", ")})`;
               })
@@ -450,17 +644,22 @@ export class Competitions {
   }
 
   /** Apply a solver's change to the main workspace. */
-  apply(service: AgentService, id: string | undefined, solver: string) {
+  async apply(
+    service: AgentService,
+    id: string | undefined,
+    solver: string,
+    project?: string,
+  ) {
     const root = this.requireRoot();
     const competition = this.find(id);
     if (competition.status === "discarded")
       throw new AgentError(`Competition ${competition.id} was discarded`);
-    const entry = competition.solvers.find((each) => each.name === solver);
-    if (entry && ACTIVE.has(stateOf(service, entry)))
+    const ownership = (await service.competitionOwners()).get(competition.id);
+    if (ACTIVE.has(statesOf(service, competition, ownership)[solver] ?? ""))
       throw new AgentError(
         `${solver} still works; wait for it, or stop it first`,
       );
-    const outcome = applySolution(root, competition, solver);
+    const outcome = applySolution(root, competition, solver, { project });
     updateCompetition(root, competition.id, (record) => ({
       ...record,
       ...(outcome.ok ? { status: "applied" as const } : {}),
@@ -487,18 +686,28 @@ export class Competitions {
   ): Promise<SolverEntry> {
     const root = this.requireRoot();
     const competition = this.find(id);
+    if (request.authorized)
+      approveCompetitionVerification(
+        root,
+        competition,
+        request.approval,
+        request.project,
+      );
+    assertBound(root, competition, request.project);
     if (competition.status === "discarded")
       throw new AgentError(`Competition ${competition.id} was discarded`);
     const names = request.from?.length
       ? [...new Set(request.from.map((name) => name.trim()))]
       : await this.bestRanked(service, competition);
+    const ownership = (await service.competitionOwners()).get(competition.id);
+    const states = statesOf(service, competition, ownership);
     const sources = names.map((name) => {
       const entry = competition.solvers.find((each) => each.name === name);
       if (!entry)
         throw new AgentError(
           `No solver ${name} in ${competition.id}; solvers: ${competition.solvers.map((each) => each.name).join(", ")}`,
         );
-      if (ACTIVE.has(stateOf(service, entry)))
+      if (ACTIVE.has(states[name] ?? ""))
         throw new AgentError(`${name} still works; wait for it first`);
       if (!fs.existsSync(entry.workspace))
         throw new AgentError(`${name}'s workspace is gone`);
@@ -513,7 +722,9 @@ export class Competitions {
     const merges = competition.solvers.filter((entry) => entry.merge).length;
     const name = `${competition.id}-m${merges + 1}`;
     const first = sources[0] as SolverEntry;
-    const workspace = prepareMergeWorkspace(root, competition, name, first);
+    const workspace = prepareMergeWorkspace(root, competition, name, first, {
+      project: request.project,
+    });
     const guidance = request.guidance?.trim();
     const model = request.model ?? first.model;
     const thinking = request.thinking ?? first.thinking;
@@ -532,6 +743,9 @@ export class Competitions {
           : COMPETE_TIMEOUT_MS),
     };
     let added = false;
+    let started: string | undefined;
+    let spawning = false;
+    let owned = entry;
     try {
       const patches = writeSourcePatches(root, competition, name, sources);
       const current = updateCompetition(root, competition.id, (record) => ({
@@ -569,28 +783,47 @@ export class Competitions {
           solver: name,
         },
       };
+      spawning = true;
       const graph = await service.spawnGraph({
         name: `compete-${name}`,
         agents: [spec],
       });
+      started = graph.id;
       const agentId = graph.nodes.find((node) => node.name === name)?.agentId;
+      owned = { ...entry, graph: graph.id, ...(agentId ? { agentId } : {}) };
       const updated = updateCompetition(root, competition.id, (record) => ({
         ...record,
         solvers: record.solvers.map((each) =>
-          each.name === name
-            ? { ...each, graph: graph.id, ...(agentId ? { agentId } : {}) }
-            : each,
+          each.name === name ? owned : each,
         ),
       }));
       return updated.solvers.find((each) => each.name === name) as SolverEntry;
     } catch (error) {
-      // Nothing started: leave no worktree or entry behind.
-      discardWorkspaces({ ...competition, solvers: [entry] });
-      if (added)
-        updateCompetition(root, competition.id, (record) => ({
-          ...record,
-          solvers: record.solvers.filter((each) => each.name !== name),
-        }));
+      if (spawning)
+        await this.stopFailedSpawn(
+          root,
+          service,
+          { ...competition, solvers: [owned] },
+          error instanceof GraphStartedError ? error.graphId : started,
+          name,
+          error,
+          name,
+        );
+      discardWorkspaces(
+        root,
+        { ...competition, solvers: [entry] },
+        { project: request.project },
+      );
+      if (added) {
+        try {
+          updateCompetition(root, competition.id, (record) => ({
+            ...record,
+            solvers: record.solvers.filter((each) => each.name !== name),
+          }));
+        } catch {
+          // Preserve the original failure; stopped workspaces are already safe.
+        }
+      }
       throw error;
     }
   }
@@ -605,7 +838,11 @@ export class Competitions {
     const comparison = await compare(
       root,
       competition,
-      statesOf(service, competition),
+      statesOf(
+        service,
+        competition,
+        (await service.competitionOwners()).get(competition.id),
+      ),
       { verify: false },
     );
     const usable = new Set(
@@ -624,24 +861,30 @@ export class Competitions {
   async discard(
     service: AgentService,
     id: string | undefined,
+    project?: string,
   ): Promise<string> {
     const root = this.requireRoot();
-    const competition = this.find(id);
-    const graphs = new Set(
-      [
-        competition.graph,
-        ...competition.solvers.map((entry) => entry.graph),
-      ].filter((each): each is string => each !== undefined),
+    const { competition } = this.inspect(id);
+    const dir = competitionDir(root, competition.id);
+    // Neither saved graph IDs nor recovery sidecars are authority to stop work.
+    const ownership = (await service.competitionOwners()).get(competition.id);
+    await this.stopOwners(service, ownership);
+    const { removed, refused } = discardWorkspaces(root, competition, {
+      project,
+    });
+    for (const name of fs.readdirSync(dir))
+      if (/^orphan-.*\.json$/.test(name)) fs.unlinkSync(path.join(dir, name));
+    unsealCompetition(root, competition.id);
+    updateCompetition(
+      root,
+      competition.id,
+      (record) => ({
+        ...record,
+        status: record.status === "applied" ? "applied" : "discarded",
+      }),
+      { allowUnsafe: true },
     );
-    for (const graph of service.graphs())
-      if (graphs.has(graph.id) && !graph.closed && graph.state === "working")
-        await service.stopTarget({ kind: "graph", id: graph.id });
-    const removed = discardWorkspaces(competition);
-    updateCompetition(root, competition.id, (record) => ({
-      ...record,
-      status: record.status === "applied" ? "applied" : "discarded",
-    }));
-    return `Discarded competition ${competition.id}: removed ${removed.length} workspace${removed.length === 1 ? "" : "s"}. Submissions, the verdict, and patches stay in ${path.join(root, "competitions", competition.id)}.`;
+    return `Discarded competition ${competition.id}: removed ${removed.length} workspace${removed.length === 1 ? "" : "s"}.${refused.length ? ` Refused unsafe paths: ${refused.join(", ")}.` : ""} Submissions, the verdict, and patches stay in ${path.join(root, "competitions", competition.id)}.`;
   }
 
   /** Stop the unfinished solvers of competitions past their deadline. */
@@ -649,33 +892,57 @@ export class Competitions {
     const root = this.root();
     if (!root) return [];
     const stopped: string[] = [];
-    for (const competition of listCompetitions(root)) {
-      if (competition.status === "discarded") continue;
-      const overdue = competition.solvers.filter(
-        (entry) =>
-          entry.agentId &&
-          (entry.deadline ?? competition.deadline) <= now &&
-          !competition.timedOut?.includes(entry.name) &&
-          ACTIVE.has(stateOf(service, entry)),
-      );
+    let expiredIds = expiredSolvers.get(service);
+    if (!expiredIds) {
+      expiredIds = new Set();
+      expiredSolvers.set(service, expiredIds);
+    }
+    const ownership = await service.competitionOwners();
+    for (const { competition } of listCompetitionStates(root)) {
+      const overdue =
+        ownership.get(competition.id)?.agents.filter((owner) => {
+          if (
+            owner.part !== "solver" ||
+            owner.stopped ||
+            expiredIds.has(owner.agentId)
+          )
+            return false;
+          const entry = competition.solvers.find(
+            (each) => each.name === owner.solver,
+          );
+          return (
+            (entry?.deadline ?? competition.deadline) <= now &&
+            ACTIVE.has(stateOf(service, owner))
+          );
+        }) ?? [];
       if (overdue.length === 0) continue;
-      updateCompetition(root, competition.id, (record) => ({
-        ...record,
-        timedOut: [
-          ...new Set([
-            ...(record.timedOut ?? []),
-            ...overdue.map((entry) => entry.name),
-          ]),
-        ],
-      }));
-      for (const entry of overdue) {
+      const expired: string[] = [];
+      for (const owner of overdue) {
         try {
           await service.stopTarget({
             kind: "agent",
-            id: entry.agentId as string,
+            id: owner.agentId,
           });
-          stopped.push(entry.name);
+          expiredIds.add(owner.agentId);
+          const name = owner.solver ?? owner.agentId;
+          stopped.push(name);
+          expired.push(name);
         } catch {}
+      }
+      if (expired.length) {
+        try {
+          updateCompetition(
+            root,
+            competition.id,
+            (record) => ({
+              ...record,
+              timedOut: [...new Set([...(record.timedOut ?? []), ...expired])],
+            }),
+            { allowUnsafe: true },
+          );
+        } catch {
+          // A broken record must not prevent stopping other competitions.
+        }
       }
     }
     return stopped;
@@ -745,13 +1012,18 @@ export function collabReport(
   view: string,
 ): string {
   if (!root) return "Agents aren't ready in this session yet.";
+  // Validate before opening a store: a status read must not create a group.
+  if (group !== undefined) resolveCollab({ group }, "parent", root);
   const groups = listGroups(root);
+  if (group !== undefined && !groups.includes(group))
+    return `No collab group ${group}.`;
   if (view === "groups" || (!group && groups.length === 0))
     return groups.length
       ? `Collab groups: ${groups.join(", ")}`
       : "No collab groups yet. Every agent you spawn joins the main group (or the group it names) and shares its blackboard, claims, and structured messages.";
   const name = group ?? (groups.includes("main") ? "main" : groups[0]);
   if (!name) return "No collab groups yet.";
+  resolveCollab({ group: name }, "parent", root);
   const store = collabStore(root, name);
   switch (view) {
     case "board":
@@ -811,7 +1083,12 @@ const competeParameters = Type.Object({
   variants: Type.Optional(
     Type.Array(
       Type.Object({
-        name: Type.Optional(Type.String()),
+        name: Type.Optional(
+          Type.String({
+            description:
+              "Solver name: letters, digits, underscores and dashes; starts with a letter or digit, at most 64 characters. Other characters become dashes; duplicates receive a numeric suffix. Judge and merge names are reserved.",
+          }),
+        ),
         hint: Type.Optional(
           Type.String({
             description:
@@ -885,6 +1162,27 @@ function show(pi: ExtensionAPI, content: string): void {
   pi.sendMessage({ customType: COLLAB_MESSAGE_TYPE, content, display: true });
 }
 
+/** Model-selected shell commands require an interactive, explicit approval.
+ * Slash commands are user-originated and do not pass through this gate. */
+export async function confirmModelVerify(
+  ctx: Pick<ExtensionContext, "hasUI" | "ui">,
+  command: string | undefined,
+  timeoutMs?: number,
+): Promise<void> {
+  if (!command) return;
+  if (!ctx.hasUI)
+    throw new AgentError(
+      "Model-requested verification requires UI confirmation; use /compete explicitly or disable verify with verify: none.",
+    );
+  if (
+    !(await ctx.ui.confirm(
+      "Run competition verification?",
+      `Run this shell command in competition workspaces?\n\n${command}${timeoutMs === undefined ? "" : `\nTimeout: ${timeoutMs} ms`}\n\nThe environment is filtered by default, but this is not a sandbox: files, HOME, network and shared dependencies remain accessible.`,
+    ))
+  )
+    throw new AgentError("Competition verification was not confirmed");
+}
+
 function reply(text: string) {
   return { content: [{ type: "text" as const, text }], details: {} };
 }
@@ -946,16 +1244,24 @@ export function registerCollab(
       try {
         if (action === "start") {
           if (!params.task?.trim()) throw new Error("start needs a task");
+          const cwd = path.resolve(ctx.cwd, params.cwd ?? ".");
+          assertProjectCwd(cwd, ctx.cwd);
+          const given = params.verify?.trim();
+          const verify =
+            given === "none" ? undefined : given || detectVerify(cwd);
+          await confirmModelVerify(ctx, verify, VERIFY_TIMEOUT_MS);
           const competition = await competitions.start(
             service,
             {
               task: params.task,
-              cwd: path.resolve(ctx.cwd, params.cwd ?? "."),
+              cwd,
+              project: ctx.cwd,
               ...(params.solvers ? { solvers: params.solvers } : {}),
               ...(params.variants ? { variants: params.variants } : {}),
               ...(params.model ? { model: params.model } : {}),
               ...(params.thinking ? { thinking: params.thinking } : {}),
-              ...(params.verify ? { verify: params.verify } : {}),
+              // Freeze the command approved above, including no command.
+              verify: verify ?? "none",
               ...(params.judge !== undefined ? { judge: params.judge } : {}),
               ...(params.judgeModel ? { judgeModel: params.judgeModel } : {}),
               ...(params.timeoutMinutes
@@ -968,19 +1274,32 @@ export function registerCollab(
         }
         if (action === "status")
           return reply(await competitions.report(service, params.id));
-        if (action === "compare")
+        if (action === "compare") {
+          const competition = competitions.find(params.id);
+          const approval = competitions.snapshot(competition);
+          await confirmModelVerify(ctx, approval?.command, approval?.timeoutMs);
           return reply(
-            await competitions.report(service, params.id, {
+            await competitions.report(service, competition.id, {
               verify: true,
               details: true,
+              approval,
+              authorized: true,
+              project: ctx.cwd,
               ...(signal ? { signal } : {}),
             }),
           );
+        }
         if (action === "merge") {
+          const competition = competitions.find(params.id);
+          const approval = competitions.snapshot(competition);
+          await confirmModelVerify(ctx, approval?.command, approval?.timeoutMs);
           const entry = await competitions.merge(
             service,
-            params.id,
+            competition.id,
             {
+              approval,
+              authorized: true,
+              project: ctx.cwd,
               ...(params.from ? { from: params.from } : {}),
               ...(params.guidance ? { guidance: params.guidance } : {}),
               ...(params.model ? { model: params.model } : {}),
@@ -995,11 +1314,16 @@ export function registerCollab(
         }
         if (action === "apply") {
           if (!params.solver) throw new Error("apply needs the solver");
-          const outcome = competitions.apply(service, params.id, params.solver);
+          const outcome = await competitions.apply(
+            service,
+            params.id,
+            params.solver,
+            ctx.cwd,
+          );
           if (!outcome.ok) throw new Error(outcome.output);
           return reply(outcome.output);
         }
-        return reply(await competitions.discard(service, params.id));
+        return reply(await competitions.discard(service, params.id, ctx.cwd));
       } catch (error) {
         throw new Error(errorText(error));
       }
@@ -1110,19 +1434,28 @@ export function registerCollab(
           }
           case "show":
             return show(pi, await competitions.report(service, words[1]));
-          case "compare":
+          case "compare": {
+            const competition = competitions.find(words[1]);
+            const approval = competitions.snapshot(competition);
             return show(
               pi,
-              await competitions.report(service, words[1], {
+              await competitions.report(service, competition.id, {
                 verify: true,
                 details: true,
+                approval,
+                authorized: true,
+                project: ctx.cwd,
               }),
             );
+          }
           case "apply": {
             const [id, solver] =
               words.length >= 3 ? [words[1], words[2]] : [undefined, words[1]];
             if (!solver) return show(pi, "Usage: /compete apply <id> <solver>");
-            return show(pi, competitions.apply(service, id, solver).output);
+            return show(
+              pi,
+              (await competitions.apply(service, id, solver, ctx.cwd)).output,
+            );
           }
           case "merge": {
             // merge [id] [solver …]: a first word naming a competition is
@@ -1132,20 +1465,30 @@ export function registerCollab(
               rest[0] && competitions.list().some((each) => each.id === rest[0])
                 ? rest.shift()
                 : undefined;
+            const competition = competitions.find(id);
+            const approval = competitions.snapshot(competition);
             const entry = await competitions.merge(
               service,
-              id,
-              rest.length ? { from: rest } : {},
+              competition.id,
+              {
+                ...(rest.length ? { from: rest } : {}),
+                approval,
+                authorized: true,
+                project: ctx.cwd,
+              },
               resolver(ctx),
             );
             return show(pi, mergeStartedText(entry, id));
           }
           case "discard":
-            return show(pi, await competitions.discard(service, words[1]));
+            return show(
+              pi,
+              await competitions.discard(service, words[1], ctx.cwd),
+            );
           default: {
             const competition = await competitions.start(
               service,
-              { task: args.trim(), cwd: ctx.cwd },
+              { task: args.trim(), cwd: ctx.cwd, project: ctx.cwd },
               resolver(ctx),
             );
             return show(pi, startedText(competition));

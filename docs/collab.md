@@ -138,6 +138,29 @@ tool.
 
 ## Competitions
 
+### Verification security
+
+Competitions require Git >=2.28 when using Git worktrees. Workspaces separate
+changes, not permissions: they are **not a sandbox**. Commands can access HOME,
+other files and the network, and linked `node_modules` are shared and writable.
+Use only trusted projects and commands, without live credentials. Verification
+has a bounded wait and attempts to terminate its process group, but detached
+processes that escape the group can outlive a timeout or abort. No OS sandbox
+or guarantee of descendant termination is provided.
+
+Model calls to `agent_compete` that start verification, compare with verification,
+or merge a verified competition require UI confirmation of the shell command.
+This includes project-detected commands. Declining runs nothing; headless model
+calls with a verify command are refused. Set `verify: "none"` when starting to
+avoid verification. Explicit `/compete` commands remain user-directed and do not
+show this confirmation. Approval covers the command, not the code it later runs:
+solvers can change tests and project scripts before verification.
+
+Verification defaults to a scrubbed environment, not full inheritance. See
+[verification environment settings](./configuration.md#verification-environment)
+for the exact modes and global-only opt-outs. Filtering cannot prevent commands
+from reading credentials from disk or abusing shared dependencies.
+
 ### Starting one
 
 Ask Pi in words, or use the command:
@@ -163,6 +186,11 @@ Pi calls `agent_compete` with `action: "start"`:
 | `judge` | true | Spawn a judge once the solvers finish. |
 | `judgeModel` | `model` | The judge's model. |
 | `timeoutMinutes` | 30 | Unfinished solvers are stopped then; the judge still runs. |
+
+A model-provided `cwd` must resolve inside the current session project (including
+its Git root). This is checked before reserving a competition ID, detecting or
+confirming verification, or copying any source files; symlinks cannot redirect
+the copy outside that project.
 
 Every solver gets a different default strategy, in order: the smallest
 change; robustness; tests first; readability; an alternative approach;
@@ -200,9 +228,11 @@ Verdict by c1-judge: winner c1-a; ranking c1-a > c1-b > c1-c
 Rationale: All three pass node --test 5/5 …
 ```
 
-`/compete compare` reruns verify where a diff
-changed and adds each solver's approach, tests, caveats, verify output,
-and diff. `/compete list` lists the session's competitions.
+`/compete compare` reruns verify for every solver and adds each solver's
+approach, tests, caveats, verify output, and diff. Submission also runs verify
+afresh, even when the diff is unchanged: ignored files, dependencies and other
+verification inputs may have changed. `/compete list` lists the session's
+competitions.
 
 ### Many solvers
 
@@ -269,10 +299,68 @@ tries a three-way merge, which stages the files and, on a conflict, leaves
 conflict markers to resolve. It refuses while that solver still works. Pi's tool guidance
 tells it to apply only when you ask. Workspaces stay until `discard`, which
 stops the competition's agents, merges included, and removes its worktrees;
-its record stays.
+its record stays. Model-callable apply/discard intentionally require no runtime
+confirmation, including headless calls. The guidance to apply only when asked is
+not an authorization boundary: prompt injection can still cause model-initiated
+application or deletion of competition workspaces. IDs, persisted records and
+workspace paths are validated independently; unsafe deletion paths are refused.
 
 ### Restarts
 
 Competitions and groups live under the session's storage. After a restart
 or `/resume`, `/compete show` and `/collab` show the same state, agents
 resume as usual, and deadlines are enforced by the session's monitor.
+
+A successful deadline stop is remembered by durable agent ID for the lifetime
+of that service, including when its monitor is recreated. A user message can
+resume that solver without the next monitor tick immediately stopping it again.
+A newly owned agent ID still has its own deadline, even with the same solver
+name; failed stops are retried. Saved `timedOut` names are diagnostics only and
+cannot suppress a first deadline stop. After an actual service/process restart,
+this memory is lost: a resumed overdue solver may cautiously be stopped again.
+
+Verification approval is process-local, not trusted from persisted records.
+After restart, automatic solver/judge verification is skipped until the command
+is freshly authorized. Model compare/merge captures the exact command and timeout
+before showing confirmation; changes during the prompt are refused. Explicit
+`/compete compare` or `/compete merge` provides user authorization without a second
+UI prompt, including headless sessions. The saved command is read once for this
+authorization, with a positive timeout of at most 60 minutes; command or timeout
+changes before execution are rejected. This intentionally trusts a saved command
+when the user types the slash command: an agent-writable record is not tamper-proof.
+A restored record must pass root/cwd consistency checks and bind to the current
+project before verification, merge, or application; those operations fail closed
+for records outside that project. An unsuccessful cross-project apply offers a
+patch for manual review/application rather than writing to the recorded project.
+
+Status/list and discard remain available for records with unsafe or missing
+workspaces. Status reports unsafe entries without reading their diffs; discard
+removes only validated workspace paths and reports refused entries. Restored
+in-project discard also removes Git worktree registrations, without approving or
+running saved verification. If the source cwd is deleted, the project binding
+fails, or trusted project context is unavailable, cleanup falls back to contained
+workspace directory removal only; it does not remove/prune Git registrations.
+This also permits safe discard after restarting in another project, without
+modifying that project's files. Stale registrations may remain and need a later
+`git worktree prune` from the independently verified original repository. Failed
+merge rollback uses project-aware cleanup when authorized project context is
+available, otherwise the same contained-only fallback applies. One unsafe entry
+does not prevent the monitor from stopping other overdue owners.
+
+Active-state checks, discard and expiry use durable service membership, not
+agent or graph IDs in `competition.json`. Missing IDs in that record do not hide
+real owners; forged IDs cannot target unrelated work. Only wholly owned graphs
+are stopped together; owners in mixed graphs are stopped individually. If durable
+ownership cannot be read, operations requiring it fail closed and retain the
+workspaces rather than assuming agents are stopped.
+
+A start or merge failure can occur after its graph was committed, even before
+the graph ID is returned. The extension reconciles durable owners and waits for
+them to stop before deleting affected workspaces. If lookup or stopping fails,
+it preserves those workspaces and attempts to save `orphan-start.json` or
+`orphan-<merge-name>.json` beside `competition.json`, with available graph and
+workspace details. These files are diagnostics, never authority to stop work,
+run verification, or apply patches. Retrying discard reconciles durable ownership
+again and removes the markers only after safe cleanup. If the main record is
+unusable, keep the reported paths and review them before manual recovery. Never
+delete a workspace while its owner may still be running.

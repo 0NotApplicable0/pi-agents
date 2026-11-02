@@ -1,5 +1,6 @@
 /** The collab store's records and the rules both backends share. */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 export const PROTOCOL = 1;
@@ -113,6 +114,25 @@ export type ClaimOutcome =
   | { ok: true; claims: Claim[] }
   | { ok: false; conflicts: Claim[] };
 
+/** Resolve a path's nearest existing ancestor, preserving nonexistent descendants.
+ * Real-file identity is shared across working directories, but not worktrees. */
+export function canonicalPath(file: string, cwd: string): string {
+  let ancestor = path.resolve(cwd, file);
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync.native(ancestor), ...suffix);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      suffix.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
 /**
  * Normalize a claim resource: `item:<id>` and `key:<text>` stay as they
  * are; anything else is a path, relative to `cwd`, so the same file named
@@ -122,20 +142,12 @@ export function normalizeResource(resource: string, cwd: string): string {
   const text = resource.trim();
   const match = /^([a-z]+):(.*)$/.exec(text);
   if (match && match[1] !== "path") return `${match[1]}:${match[2]?.trim()}`;
-  let file = (match ? match[2] : text)?.trim() ?? "";
-  if (path.isAbsolute(file)) file = path.relative(cwd, file);
-  file = path.posix.normalize(file.split(path.sep).join("/"));
-  if (file === "." || file === "./") file = "";
-  file = file.replace(/^\.\//, "");
-  if (file.startsWith("../"))
-    throw new Error(
-      `Claimed path ${resource} lies outside your working directory`,
-    );
-  return `path:${file}`;
+  const file = (match ? match[2] : text)?.trim() ?? "";
+  return `path:${canonicalPath(file, cwd)}`;
 }
 
 /** Whether two normalized resources conflict: equal, or one path holds
- * the other. `path:` (the whole tree) holds every path. */
+ * the other. `path:/` holds every absolute path (`path:` is legacy). */
 export function overlaps(left: string, right: string): boolean {
   if (left === right) return true;
   if (!left.startsWith("path:") || !right.startsWith("path:")) return false;
@@ -170,6 +182,13 @@ export function foldTask(
   if ((OPENING_TYPES as readonly string[]).includes(message.type)) {
     if (known) {
       known.assignees = [...new Set([...known.assignees, message.toName])];
+      // An answer can be persisted first. Fill its placeholder with the
+      // request's metadata without overwriting the newer answer's state.
+      if (!known.requester) {
+        known.requester = message.fromName;
+        known.title = message.text.split("\n")[0]?.slice(0, 120) ?? "";
+      }
+      known.refs = [...new Set([...known.refs, ...message.refs])];
       return;
     }
     tasks.set(message.task, {
@@ -184,9 +203,23 @@ export function foldTask(
     });
     return;
   }
-  // Answers to a request this group never saw are dropped, as are those
-  // older than the task's latest state.
-  if (!known || message.sentAt < known.updatedAt) return;
+  // Keep orphan answers until the opening request arrives. An empty
+  // requester marks a placeholder, including after backend serialization;
+  // open-work views omit these until an opening supplies the metadata.
+  if (!known) {
+    tasks.set(message.task, {
+      id: message.task,
+      requester: "",
+      assignees: [message.fromName],
+      status: message.type as TaskStatus,
+      title: "",
+      refs: message.refs,
+      updatedAt: message.sentAt,
+      last: `${message.fromName}: ${message.text}`,
+    });
+    return;
+  }
+  if (message.sentAt < known.updatedAt) return;
   known.status = message.type as TaskStatus;
   known.updatedAt = message.sentAt;
   known.last = `${message.fromName}: ${message.text}`;

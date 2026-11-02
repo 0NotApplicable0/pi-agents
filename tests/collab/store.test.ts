@@ -4,11 +4,13 @@
  * database does: importing a file group, retention, and WAL.
  */
 
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { board, overview } from "../../src/collab/ops.js";
 import {
+  CLAIM_GRACE_MS,
+  type Claim,
   CollabStore,
   forgetCollabCaches,
   type MemberRecord,
@@ -108,6 +110,37 @@ for (const backend of ["sqlite", "files"] as const)
         expect(overview(store)).toContain("3 entries");
       });
 
+      test("out-of-order updates keep summaries current and timestamps monotonic", () => {
+        const store = new CollabStore(root, "g");
+        post(store, "b1", "one", 1_000);
+        post(store, "b2", "two", 2_000);
+        store.update("b1", "agent-a", { status: "doing", at: 5_000 });
+        // Populate the index fold before an older update is appended.
+        expect(store.summaries()[0]?.status).toBe("doing");
+        const change = { status: "done" as const, note: "late", at: 3_000 };
+        const updated = store.update("b1", "agent-b", change);
+        expect(updated.updatedAt).toBe(5_000);
+        expect(updated.history.map((each) => each.at)).toEqual([5_000, 3_000]);
+        expect(store.update("b1", "agent-b", change)).toEqual(updated);
+
+        const check = (current: CollabStore) => {
+          const summary = current
+            .summaries({ all: true })
+            .find((each) => each.id === "b1");
+          expect(summary).toMatchObject({ status: "done", updatedAt: 5_000 });
+          expect(current.entry("b1")).toEqual(updated);
+          expect(current.summaries().map((each) => each.id)).toEqual(["b2"]);
+          expect(current.boardCounts().byStatus).toMatchObject({
+            open: 1,
+            doing: 0,
+            done: 1,
+          });
+        };
+        check(store);
+        forgetCollabCaches();
+        check(new CollabStore(root, "g"));
+      });
+
       test("an empty board says so", () => {
         const store = new CollabStore(root, "g");
         expect(board(store, undefined, { action: "read" }).text).toContain(
@@ -205,6 +238,129 @@ for (const backend of ["sqlite", "files"] as const)
     });
 
     describe("claims", () => {
+      test("legacy migration skips invalid paths, preserves valid claims, and stays idempotent", () => {
+        let store = new CollabStore(root, "g");
+        const a = member(store, "a");
+        const b = member(store, "b");
+        const cwd = fs.realpathSync(root);
+        fs.mkdirSync(path.join(cwd, "pkg"));
+        fs.symlinkSync("loop", path.join(cwd, "loop"));
+        store.upsertMember({ ...a, cwd });
+        store.upsertMember({ ...b, cwd: path.join(cwd, "pkg") });
+        const identity = `path:${path.join(cwd, "pkg", "x.ts")}`;
+        const legacy: Claim[] = [
+          {
+            owner: a.key,
+            ownerName: "a",
+            resource: "path:pkg/x.ts",
+            claimedAt: 1,
+            note: "kept",
+            expiresAt: Date.now() + 60_000,
+          },
+          { owner: b.key, ownerName: "b", resource: "path:x.ts", claimedAt: 2 },
+          { owner: a.key, ownerName: "a", resource: "path:", claimedAt: 3 },
+          {
+            owner: b.key,
+            ownerName: "b",
+            resource: `path:${path.join(cwd, "absolute.ts")}`,
+            claimedAt: 4,
+          },
+          {
+            owner: a.key,
+            ownerName: "a",
+            resource: "key:opaque",
+            claimedAt: 5,
+          },
+          { owner: b.key, ownerName: "b", resource: "item:b1", claimedAt: 6 },
+          {
+            owner: "missing",
+            ownerName: "missing",
+            resource: "path:lost.ts",
+            claimedAt: 7,
+          },
+          {
+            owner: "missing",
+            ownerName: "missing",
+            resource: "key:lost",
+            claimedAt: 8,
+          },
+          {
+            owner: a.key,
+            ownerName: "a",
+            resource: "path:loop/x.ts",
+            claimedAt: 9,
+          },
+        ];
+        if (backend === "files") {
+          fs.writeFileSync(
+            path.join(store.dir, "claims.json"),
+            JSON.stringify({ claims: legacy }),
+          );
+        } else {
+          const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as {
+            DatabaseSync: new (
+              file: string,
+            ) => {
+              exec(sql: string): void;
+              prepare(sql: string): {
+                run(...args: (string | number | null)[]): unknown;
+              };
+              close(): void;
+            };
+          };
+          const db = new DatabaseSync(path.join(store.dir, "collab.db"));
+          try {
+            db.exec("DELETE FROM meta WHERE key = 'claims'");
+            for (const claim of legacy)
+              db.prepare(
+                "INSERT INTO claims (owner, resource, owner_name, note, claimed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+              ).run(
+                claim.owner,
+                claim.resource,
+                claim.ownerName,
+                claim.note ?? null,
+                claim.claimedAt,
+                claim.expiresAt ?? null,
+              );
+          } finally {
+            db.close();
+          }
+        }
+        const warning = spyOn(process, "emitWarning").mockImplementation(
+          () => {},
+        );
+        try {
+          forgetCollabCaches();
+          store = new CollabStore(root, "g");
+          const expected = legacy.slice(0, 6).map((claim, index) => ({
+            ...claim,
+            resource:
+              index < 2
+                ? identity
+                : index === 2
+                  ? `path:${cwd}`
+                  : claim.resource,
+          }));
+          expect(store.claims()).toEqual(expected);
+          expect(store.claims()).toEqual(expected);
+          forgetCollabCaches();
+          store = new CollabStore(root, "g");
+          expect(store.claims()).toEqual(expected);
+          expect(store.release(a.key, [identity])).toEqual([expected[0]]);
+          forgetCollabCaches();
+          expect(new CollabStore(root, "g").claims()).toEqual(
+            expected.slice(1),
+          );
+          expect(warning).toHaveBeenCalledTimes(1);
+          expect(warning).toHaveBeenCalledWith(
+            "Dropped an invalid legacy path claim during collab migration",
+            { code: "PI_AGENTS_COLLAB_CLAIM_MIGRATION" },
+          );
+        } finally {
+          warning.mockRestore();
+        }
+      });
+
       test("a member that exits loses its claims, in this process and a fresh one", () => {
         const store = new CollabStore(root, "g");
         const a = member(store, "a");
@@ -219,6 +375,116 @@ for (const backend of ["sqlite", "files"] as const)
         expect(fresh.claims().map((claim) => claim.ownerName)).toEqual(["b"]);
         expect(fresh.member(a.key)?.status).toBe("exited");
         expect(fresh.claim(a, ["src/x.ts"]).ok).toBe(false);
+      });
+
+      for (const restart of [false, true]) {
+        for (const reclaim of [false, true]) {
+          test(`exited claims never revive (restart=${restart}, reclaim=${reclaim})`, () => {
+            let store = new CollabStore(root, "g");
+            const a = member(store, "a");
+            const b = member(store, "b");
+            store.claim(a, ["src/x.ts"]);
+            store.setStatus(a.key, "exited");
+            if (reclaim) expect(store.claim(b, ["src/x.ts"]).ok).toBe(true);
+            if (restart) {
+              forgetCollabCaches();
+              store = new CollabStore(root, "g");
+            }
+            member(store, "a");
+            const expected = reclaim ? [b.key] : [];
+            expect(store.claims().map((claim) => claim.owner)).toEqual(
+              expected,
+            );
+            forgetCollabCaches();
+            expect(
+              new CollabStore(root, "g").claims().map((claim) => claim.owner),
+            ).toEqual(expected);
+          });
+        }
+
+        test(`stale paused claims never revive (restart=${restart})`, () => {
+          let store = new CollabStore(root, "g");
+          const a = member(store, "a");
+          store.claim(a, ["src/x.ts"]);
+          store.setStatus(a.key, "paused");
+          expect(store.claims()).toHaveLength(1);
+          const clock = spyOn(Date, "now").mockReturnValue(
+            Date.now() + CLAIM_GRACE_MS + 1,
+          );
+          try {
+            if (restart) {
+              forgetCollabCaches();
+              store = new CollabStore(root, "g");
+            }
+            member(store, "a");
+            expect(store.claims()).toEqual([]);
+            forgetCollabCaches();
+            expect(new CollabStore(root, "g").claims()).toEqual([]);
+          } finally {
+            clock.mockRestore();
+          }
+        });
+      }
+
+      test("resuming a stale paused member through setStatus cannot revive claims", () => {
+        const store = new CollabStore(root, "g");
+        const a = member(store, "a");
+        const b = member(store, "b");
+        store.claim(a, ["src/x.ts"]);
+        store.setStatus(a.key, "paused");
+        const clock = spyOn(Date, "now").mockReturnValue(
+          Date.now() + CLAIM_GRACE_MS + 1,
+        );
+        try {
+          store.setStatus(a.key, "live");
+          expect(store.claims()).toEqual([]);
+          expect(store.claim(b, ["src/x.ts"]).ok).toBe(true);
+          forgetCollabCaches();
+          expect(
+            new CollabStore(root, "g").claims().map((claim) => claim.owner),
+          ).toEqual([b.key]);
+        } finally {
+          clock.mockRestore();
+        }
+      });
+
+      test("even a conflicting claim purges nonholders before they can register", () => {
+        const store = new CollabStore(root, "g");
+        const a = member(store, "a");
+        const b = member(store, "b");
+        store.claim(a, ["busy"]);
+        // Low-level callers can leave a claim without a member record.
+        store.claim({ key: "agent-unknown", name: "unknown" }, ["orphan"]);
+        const persistedCount = () => {
+          if (backend === "files")
+            return JSON.parse(
+              fs.readFileSync(path.join(store.dir, "claims.json"), "utf8"),
+            ).claims.length;
+          const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as {
+            DatabaseSync: new (
+              file: string,
+            ) => {
+              prepare(sql: string): { get(): { count: number } };
+              close(): void;
+            };
+          };
+          const db = new DatabaseSync(path.join(store.dir, "collab.db"));
+          try {
+            return db.prepare("SELECT COUNT(*) AS count FROM claims").get()
+              .count;
+          } finally {
+            db.close();
+          }
+        };
+        expect(persistedCount()).toBe(2);
+        expect(store.claim(b, ["busy"]).ok).toBe(false);
+        expect(persistedCount()).toBe(1);
+        member(store, "unknown");
+        expect(store.claims().map((claim) => claim.resource)).toEqual(["busy"]);
+        forgetCollabCaches();
+        expect(
+          new CollabStore(root, "g").claims().map((claim) => claim.resource),
+        ).toEqual(["busy"]);
       });
 
       test("a status another process writes reaches this one's cache", () => {

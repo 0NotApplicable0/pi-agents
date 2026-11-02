@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Context } from "@earendil-works/chord";
 import {
   estimateTokens,
@@ -10,6 +10,28 @@ import { DEFAULT_LIMITS, readLimits } from "../../src/host/settings.js";
 
 const context = (signal?: AbortSignal) =>
   ({ ...(signal ? { abortSignal: signal } : {}) }) as unknown as Context;
+
+/** Invoke the registered hooks without constructing a durable session. */
+function requestHooks(requests: ModelRequests) {
+  type Api = { conversationId: string; taskId: string };
+  type Request = { messages: unknown[] };
+  return {
+    generation: requests.hooks[0]?.handlers as unknown as {
+      beforeRequest(request: Request, api: Api, ctx: Context): Promise<unknown>;
+      afterResponse(
+        message: {
+          usage: { totalTokens: number };
+          stopReason?: string;
+          errorMessage?: string;
+        },
+        api: Api,
+      ): void;
+    },
+    compaction: requests.hooks[1]?.handlers as unknown as {
+      beforeCompact(request: Request, api: Api, ctx: Context): Promise<unknown>;
+    },
+  };
+}
 
 /** Whether a promise settled by the next turns of the event loop. */
 async function settled(promise: Promise<unknown>): Promise<boolean> {
@@ -78,13 +100,207 @@ describe("model requests", () => {
     expect(requests.used()).toBe(700);
   });
 
-  test("a request larger than the budget runs alone", async () => {
+  test("a request larger than the budget fails fast without blocking the queue", async () => {
     const requests = new ModelRequests({ tokensPerMinute: 100 });
-    expect(await settled(requests.acquire("a", 5_000, context()))).toBe(true);
-    const b = requests.acquire("b", 10, context());
+    await expect(requests.acquire("a", 101, context())).rejects.toThrow(
+      "exceeds token budget 100",
+    );
+    expect(requests.queued).toBe(0);
+    expect(requests.used()).toBe(0);
+    await requests.acquire("b", 100, context());
+    requests.settle("b", { tokens: 0 });
+  });
+
+  test("abort after admission frees capacity, wakes waiters, and allows late usage", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 100 });
+    const controller = new AbortController();
+    await requests.acquire("a", 100, context(controller.signal));
+    const b = requests.acquire("b", 100, context());
     expect(await settled(b)).toBe(false);
+    controller.abort();
+    await b;
+    expect(requests.used()).toBe(100);
+    // A late response charges a's actual usage, without releasing b.
+    requests.settle("a", { tokens: 25 });
+    expect(requests.used()).toBe(125);
+    requests.settle("b", { tokens: 0 });
+    expect(requests.used()).toBe(25);
+  });
+
+  test("abort after settlement is a no-op for a newer reservation", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 100 });
+    const controller = new AbortController();
+    await requests.acquire("a", 100, context(controller.signal));
     requests.settle("a", { tokens: 0 });
-    expect(await settled(b)).toBe(true);
+    await requests.acquire("a", 80, context());
+    controller.abort();
+    expect(requests.used()).toBe(80);
+    requests.settle("a", { tokens: 0 });
+  });
+
+  test("stale reservations wake a waiter at the 120-second lease, and settle late", async () => {
+    let now = 10_000;
+    const requests = new ModelRequests({
+      tokensPerMinute: 100,
+      now: () => now,
+    });
+    let wake: (() => void) | undefined;
+    let delay: number | undefined;
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+      (callback, ms) => {
+        wake = callback as () => void;
+        delay = ms;
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      },
+    );
+    const clear = spyOn(globalThis, "clearTimeout").mockImplementation(
+      () => {},
+    );
+    try {
+      await requests.acquire("a", 100, context());
+      const b = requests.acquire("b", 100, context());
+      expect(requests.queued).toBe(1);
+      expect(delay).toBe(120_000);
+      expect(wake).toBeDefined();
+      now += 120_000;
+      wake?.();
+      await b;
+      expect(requests.queued).toBe(0);
+      expect(requests.used()).toBe(100);
+      requests.settle("a", { tokens: 30 });
+      expect(requests.used()).toBe(130);
+      requests.settle("b", { tokens: 0 });
+    } finally {
+      timer.mockRestore();
+      clear.mockRestore();
+    }
+  }, 1_000);
+
+  test("simultaneous generation tasks and compaction share usage, not reservations", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 1_000 });
+    const { generation, compaction } = requestHooks(requests);
+    const first = { conversationId: "same", taskId: "g1" };
+    const second = { conversationId: "same", taskId: "g2" };
+    const compact = { conversationId: "same", taskId: "c1" };
+    const messages = [{ text: "x".repeat(389) }]; // 100 tokens each
+    await Promise.all([
+      generation.beforeRequest({ messages }, first, context()),
+      generation.beforeRequest({ messages }, second, context()),
+      compaction.beforeCompact({ messages }, compact, context()),
+    ]);
+    expect(requests.used()).toBe(300);
+    generation.afterResponse({ usage: { totalTokens: 20 } }, first);
+    expect(requests.used()).toBe(220);
+    generation.afterResponse({ usage: { totalTokens: 30 } }, second);
+    expect(requests.used()).toBe(150);
+    // Repeated delivery cannot charge the same response twice.
+    generation.afterResponse({ usage: { totalTokens: 30 } }, second);
+    expect(requests.used()).toBe(150);
+  });
+
+  test("deferred success and error responses settle across distinct phase runtimes", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 200 });
+    const { generation } = requestHooks(requests);
+    const request = { messages: [{ text: "x".repeat(389) }] };
+    for (const error of [undefined, "429; retry-after-ms: 1"]) {
+      const taskId = error ? "error-task" : "success-task";
+      const requestApi = { conversationId: "same", taskId };
+      const pollApi = { conversationId: "same", taskId };
+      expect(requestApi).not.toBe(pollApi);
+      await generation.beforeRequest(request, requestApi, context());
+      generation.afterResponse(
+        {
+          usage: { totalTokens: 20 },
+          ...(error ? { stopReason: "error", errorMessage: error } : {}),
+        },
+        pollApi,
+      );
+      expect(requests.used()).toBe(error ? 40 : 20);
+    }
+    expect(requests.limited).toBe(1);
+  }, 1_000);
+
+  test("the next request releases an unseen attempt of the same task", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 100 });
+    const { generation } = requestHooks(requests);
+    const request = { messages: [{ text: "x".repeat(389) }] };
+    const controller = new AbortController();
+    await generation.beforeRequest(
+      request,
+      { conversationId: "same", taskId: "retry-task" },
+      context(controller.signal),
+    );
+    // A stream error skipped afterResponse; retry uses a fresh phase API.
+    await generation.beforeRequest(
+      request,
+      { conversationId: "same", taskId: "retry-task" },
+      context(),
+    );
+    expect(requests.used()).toBe(100);
+    controller.abort();
+    expect(requests.used()).toBe(100);
+    generation.afterResponse(
+      { usage: { totalTokens: 10 } },
+      { conversationId: "same", taskId: "retry-task" },
+    );
+    expect(requests.used()).toBe(10);
+  }, 1_000);
+
+  test("oversized compaction waits to run alone and charges only the budget", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 100 });
+    await requests.acquire("busy", 10, context());
+    const compact = requestHooks(requests).compaction.beforeCompact(
+      { messages: [{ text: "x".repeat(1_989) }] }, // 500 tokens
+      { conversationId: "same", taskId: "compact" },
+      context(),
+    );
+    expect(await settled(compact)).toBe(false);
+    requests.settle("busy", { tokens: 0 });
+    await compact;
+    expect(requests.used()).toBe(100);
+    const controller = new AbortController();
+    const next = requests.acquire("next", 1, context(controller.signal));
+    expect(await settled(next)).toBe(false);
+    controller.abort(new Error("test cleanup"));
+    await expect(next).rejects.toThrow("test cleanup");
+  }, 1_000);
+
+  test("late generation response cannot release another task's reservation", async () => {
+    const requests = new ModelRequests({ tokensPerMinute: 200 });
+    const { generation } = requestHooks(requests);
+    const first = { conversationId: "same", taskId: "g1" };
+    const second = { conversationId: "same", taskId: "g2" };
+    const controller = new AbortController();
+    const request = { messages: [{ text: "x".repeat(389) }] };
+    await generation.beforeRequest(request, first, context(controller.signal));
+    controller.abort();
+    expect(requests.used()).toBe(0);
+    await generation.beforeRequest(request, second, context());
+    generation.afterResponse({ usage: { totalTokens: 40 } }, first);
+    expect(requests.used()).toBe(140);
+    generation.afterResponse({ usage: { totalTokens: 40 } }, first);
+    expect(requests.used()).toBe(140);
+    generation.afterResponse({ usage: { totalTokens: 20 } }, second);
+    expect(requests.used()).toBe(60);
+  }, 1_000);
+
+  test("compaction charging does not reset exponential backoff", async () => {
+    let now = 0;
+    const requests = new ModelRequests({
+      tokensPerMinute: 1_000,
+      now: () => now,
+      random: () => 0,
+    });
+    requests.settle("rate", { tokens: 0, error: "429" });
+    now = 1_000;
+    await requestHooks(requests).compaction.beforeCompact(
+      { messages: [{ text: "x".repeat(389) }] },
+      { conversationId: "same", taskId: "c1" },
+      context(),
+    );
+    expect(requests.used()).toBe(100);
+    requests.settle("rate", { tokens: 0, error: "429" });
+    expect(requests.backoffUntil).toBe(3_000);
   });
 
   test("a rate limit pauses every agent until Retry-After, then resumes", async () => {

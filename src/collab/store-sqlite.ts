@@ -31,6 +31,7 @@ import {
   type Claim,
   type ClaimOutcome,
   type CollabMessage,
+  canonicalPath,
   FINISHED_STATUSES,
   foldTask,
   isFinished,
@@ -348,7 +349,10 @@ export class SqliteStore implements StoreBackend {
     const done = this.statement("SELECT value FROM meta WHERE key = ?").get(
       "schema",
     );
-    if (done) return;
+    if (done) {
+      this.migrateClaims();
+      return;
+    }
     this.transaction(() => {
       if (this.statement("SELECT value FROM meta WHERE key = ?").get("schema"))
         return;
@@ -376,6 +380,53 @@ export class SqliteStore implements StoreBackend {
         SCHEMA_VERSION,
       );
     });
+    this.migrateClaims();
+  }
+
+  /** Legacy path claims were relative to their owner's cwd. Upgrade
+   * once, preserving opaque keys and already absolute path identities. */
+  private migrateClaims(): void {
+    if (
+      this.statement("SELECT value FROM meta WHERE key = 'claims'").get()
+        ?.value === "2"
+    )
+      return;
+    this.transaction(() => {
+      if (
+        this.statement("SELECT value FROM meta WHERE key = 'claims'").get()
+          ?.value === "2"
+      )
+        return;
+      const claims = this.statement(
+        "SELECT * FROM claims ORDER BY claimed_at, rowid",
+      )
+        .all()
+        .map(claimOf);
+      this.statement("DELETE FROM claims").run();
+      for (const claim of claims) {
+        const owner = this.member(claim.owner);
+        if (!owner) continue;
+        const file = claim.resource.startsWith("path:")
+          ? claim.resource.slice(5)
+          : undefined;
+        let resource = claim.resource;
+        if (file !== undefined && !path.isAbsolute(file)) {
+          try {
+            resource = `path:${canonicalPath(file, owner.cwd)}`;
+          } catch {
+            process.emitWarning(
+              "Dropped an invalid legacy path claim during collab migration",
+              { code: "PI_AGENTS_COLLAB_CLAIM_MIGRATION" },
+            );
+            continue;
+          }
+        }
+        this.putClaim({ ...claim, resource });
+      }
+      this.statement(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('claims', '2')",
+      ).run();
+    });
   }
 
   // Members
@@ -389,8 +440,12 @@ export class SqliteStore implements StoreBackend {
 
   upsertMember(member: Omit<MemberRecord, "protocol">): MemberRecord {
     const record: MemberRecord = { protocol: PROTOCOL, ...member };
-    this.putMember(record);
-    return record;
+    return this.transaction(() => {
+      this.purgeClaims(Date.now());
+      this.putMember(record);
+      this.purgeClaims(Date.now());
+      return record;
+    });
   }
 
   member(key: string): MemberRecord | undefined {
@@ -404,12 +459,14 @@ export class SqliteStore implements StoreBackend {
     this.transaction(() => {
       const member = this.member(key);
       if (!member) return;
+      this.purgeClaims(Date.now());
       this.putMember({
         ...member,
         status,
         ...(state ? { state } : {}),
         updatedAt: Date.now(),
       });
+      this.purgeClaims(Date.now());
     });
   }
 
@@ -560,7 +617,7 @@ export class SqliteStore implements StoreBackend {
       const updated: BoardEntry = {
         ...entry,
         ...(change.status ? { status: change.status } : {}),
-        updatedAt: at,
+        updatedAt: Math.max(entry.updatedAt, at),
         history: [
           ...entry.history,
           {
@@ -679,6 +736,14 @@ export class SqliteStore implements StoreBackend {
     );
   }
 
+  /** Remove nonholders while the write lock is held, before an owner can
+   * become live again. */
+  private purgeClaims(now: number): void {
+    this.statement(
+      "DELETE FROM claims WHERE expires_at <= ? OR NOT EXISTS (SELECT 1 FROM members WHERE members.key = claims.owner AND (status = 'live' OR (status = 'paused' AND updated_at > ?)))",
+    ).run(now, now - CLAIM_GRACE_MS);
+  }
+
   /** The claims that still hold: unexpired, of a holding owner. */
   private holding(now: number, owner?: string): Claim[] {
     const holders = this.holders(now);
@@ -705,6 +770,7 @@ export class SqliteStore implements StoreBackend {
   ): ClaimOutcome {
     return this.transaction((): ClaimOutcome => {
       const now = Date.now();
+      this.purgeClaims(now);
       const current = this.holding(now);
       const conflicts = current.filter(
         (claim) =>
@@ -712,10 +778,6 @@ export class SqliteStore implements StoreBackend {
           resources.some((resource) => overlaps(resource, claim.resource)),
       );
       if (conflicts.length > 0) return { ok: false, conflicts };
-      // Claims that no longer hold go as the table changes.
-      this.statement(
-        "DELETE FROM claims WHERE expires_at IS NOT NULL AND expires_at <= ?",
-      ).run(now);
       const fresh = [...new Set(resources)].map(
         (resource): Claim => ({
           resource,

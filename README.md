@@ -102,6 +102,21 @@ verify with "bun test tests/date.test.ts" and let a judge pick.
 /compete discard c1  remove the solvers' worktrees
 ```
 
+Competitions require Git >=2.28 for worktrees and are not a sandbox: HOME,
+files, network and linked dependencies remain accessible. Verification scrubs
+sensitive environment names by default; model-requested verify commands require
+UI confirmation and are refused unconfirmed headless. Explicit `/compete`
+commands remain user-directed: after restart, slash compare/merge authorize the
+saved verification without another prompt, after same-project and timeout checks.
+Autonomous solver/judge verification stays skipped until freshly authorized;
+unsealed cross-project apply fails closed and offers a patch instead. Detached
+processes may outlive verification timeouts; no OS sandbox is provided.
+Model-callable apply/discard intentionally have no runtime confirmation, so
+prompt-injection risk remains. Existing resource
+settings still accept project overrides, even in untrusted checkouts. See the
+[security boundaries](docs/collab.md#verification-security) and
+[environment policy](docs/configuration.md#verification-environment).
+
 See [Working together](docs/collab.md) and its
 [design](docs/collab-design.md).
 

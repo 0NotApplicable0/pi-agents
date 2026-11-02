@@ -54,6 +54,7 @@ import {
   type Claim,
   type ClaimOutcome,
   type CollabMessage,
+  canonicalPath,
   foldTask,
   isFinished,
   type MemberRecord,
@@ -172,8 +173,12 @@ export class FileStore implements StoreBackend {
   /** Register or refresh a member. */
   upsertMember(member: Omit<MemberRecord, "protocol">): MemberRecord {
     const record: MemberRecord = { protocol: PROTOCOL, ...member };
-    this.writeMember(record);
-    return record;
+    return this.lock(() => {
+      this.purgeClaims(Date.now());
+      this.writeMember(record);
+      this.purgeClaims(Date.now());
+      return record;
+    });
   }
 
   member(key: string): MemberRecord | undefined {
@@ -182,15 +187,19 @@ export class FileStore implements StoreBackend {
 
   /** Change a member's status and state, keeping its entry. */
   setStatus(key: string, status: MemberStatus, state?: string): void {
-    // The file, not the cache: a status write must not lose another
-    // process's newer one.
-    const member = readJson<MemberRecord>(this.memberFile(key));
-    if (!member) return;
-    this.writeMember({
-      ...member,
-      status,
-      ...(state ? { state } : {}),
-      updatedAt: Date.now(),
+    this.lock(() => {
+      // The file, not the cache: a status write must not lose another
+      // process's newer one.
+      const member = readJson<MemberRecord>(this.memberFile(key));
+      if (!member) return;
+      this.purgeClaims(Date.now());
+      this.writeMember({
+        ...member,
+        status,
+        ...(state ? { state } : {}),
+        updatedAt: Date.now(),
+      });
+      this.purgeClaims(Date.now());
     });
   }
 
@@ -434,7 +443,7 @@ export class FileStore implements StoreBackend {
       const updated: BoardEntry = {
         ...entry,
         ...(change.status ? { status: change.status } : {}),
-        updatedAt: at,
+        updatedAt: Math.max(entry.updatedAt, at),
         history: [
           ...entry.history,
           {
@@ -519,8 +528,52 @@ export class FileStore implements StoreBackend {
     return path.join(this.dir, "claims.json");
   }
 
+  /** Read under the lock, converting legacy relative paths using each
+   * owner's cwd. Absolute identities and opaque keys are already stable. */
   private readClaims(): Claim[] {
-    return readJson<{ claims: Claim[] }>(this.claimsFile())?.claims ?? [];
+    const stored =
+      readJson<{ claims: Claim[] }>(this.claimsFile())?.claims ?? [];
+    const members = this.memberMap();
+    let changed = false;
+    const claims: Claim[] = [];
+    for (const claim of stored) {
+      const owner = members.get(claim.owner);
+      if (!owner) {
+        changed = true;
+        continue;
+      }
+      const file = claim.resource.startsWith("path:")
+        ? claim.resource.slice(5)
+        : undefined;
+      if (file !== undefined && !path.isAbsolute(file)) {
+        changed = true;
+        let resource: string;
+        try {
+          resource = `path:${canonicalPath(file, owner.cwd)}`;
+        } catch {
+          process.emitWarning(
+            "Dropped an invalid legacy path claim during collab migration",
+            { code: "PI_AGENTS_COLLAB_CLAIM_MIGRATION" },
+          );
+          continue;
+        }
+        claims.push({ ...claim, resource });
+      } else claims.push(claim);
+    }
+    if (changed) writeJsonAtomic(this.claimsFile(), { claims });
+    return claims;
+  }
+
+  /** Purge under the lock using members read from disk, not a potentially
+   * stale process cache. Do this before reviving a member, too. */
+  private purgeClaims(now: number): Claim[] {
+    this.cache.members = undefined;
+    const members = this.memberMap();
+    const stored = this.readClaims();
+    const current = stored.filter((claim) => this.holds(claim, now, members));
+    if (current.length !== stored.length)
+      writeJsonAtomic(this.claimsFile(), { claims: current });
+    return current;
   }
 
   /** Whether a claim still holds: unexpired, and its owner is live, or
@@ -538,9 +591,14 @@ export class FileStore implements StoreBackend {
   }
 
   claims(): Claim[] {
-    const now = Date.now();
-    const members = this.memberMap();
-    return this.readClaims().filter((claim) => this.holds(claim, now, members));
+    return this.lock(() => {
+      this.cache.members = undefined;
+      const now = Date.now();
+      const members = this.memberMap();
+      return this.readClaims().filter((claim) =>
+        this.holds(claim, now, members),
+      );
+    });
   }
 
   /**
@@ -555,10 +613,7 @@ export class FileStore implements StoreBackend {
   ): ClaimOutcome {
     return this.lock(() => {
       const now = Date.now();
-      const members = this.memberMap();
-      const current = this.readClaims().filter((claim) =>
-        this.holds(claim, now, members),
-      );
+      const current = this.purgeClaims(now);
       const conflicts = current.filter(
         (claim) =>
           claim.owner !== owner.key &&
@@ -589,10 +644,7 @@ export class FileStore implements StoreBackend {
   release(owner: string, resources?: string[]): Claim[] {
     return this.lock(() => {
       const now = Date.now();
-      const members = this.memberMap();
-      const current = this.readClaims().filter((claim) =>
-        this.holds(claim, now, members),
-      );
+      const current = this.purgeClaims(now);
       const released = current.filter(
         (claim) =>
           claim.owner === owner &&

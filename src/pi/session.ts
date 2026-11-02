@@ -33,7 +33,10 @@ import type { Parent } from "../agents/parent.js";
 import { AgentService } from "../agents/service.js";
 import { AgentError } from "../agents/types.js";
 import { SkillCatalog } from "../catalog/skills.js";
-import { configureVerifyConcurrency } from "../collab/compete.js";
+import {
+  configureVerifyConcurrency,
+  configureVerifyEnv,
+} from "../collab/compete.js";
 import { configureRetention } from "../collab/store.js";
 import type { AgentHooks } from "../hooks.js";
 import { type AgentHarness, openAgentHarness } from "../host/harness.js";
@@ -45,7 +48,12 @@ import { beforeRequestHooks } from "../host/hooks.js";
 import { acquireLock, type StorageLock } from "../host/lock.js";
 import { resolveModels } from "../host/models.js";
 import { pruneSessions, readRetention } from "../host/retention.js";
-import { DEFAULT_LIMITS, type Limits, readLimits } from "../host/settings.js";
+import {
+  DEFAULT_LIMITS,
+  type Limits,
+  readLimits,
+  readVerifySettings,
+} from "../host/settings.js";
 import { openStorage, type Storage } from "../host/storage.js";
 import { captureAgentState, discoverAgentHooks } from "./hooks.js";
 import { notify } from "./notify.js";
@@ -268,6 +276,14 @@ export class SessionHost {
         closedTasks: limits.collabRetainClosedTasks,
       });
       configureVerifyConcurrency(limits.verifyConcurrency);
+      // Environment opt-outs must not be supplied by a checked-out project.
+      // Resource limits intentionally retain Pi's current merged settings.
+      const verifySettings = readVerifySettings(
+        settingsManager.getGlobalSettings(),
+      );
+      for (const error of verifySettings.errors)
+        this.report(new Error(`${error}; the default applies`));
+      configureVerifyEnv(verifySettings.mode, verifySettings.passthrough);
       const extensions = createAgentExtensions({
         ...(limits.maxWorkingAgents === undefined
           ? {}
