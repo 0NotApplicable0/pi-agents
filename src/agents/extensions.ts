@@ -14,8 +14,17 @@ import {
   type Registry,
 } from "@earendil-works/pi-durable";
 import { createPromptExtension, type PromptOptions } from "../host/prompt.js";
+import { ModelRequests } from "../host/requests.js";
 import { createToolsExtension } from "../host/tools.js";
 import { WorkingAgents } from "../host/working.js";
+import {
+  type CollabBinding,
+  collabSelection,
+  createCollabExtension,
+  createCompeteExtension,
+  detachedCollab,
+  type TeamLimits,
+} from "./collab.js";
 import { createGraphsExtension } from "./graphs.js";
 import { MessagingHub } from "./hub.js";
 import {
@@ -38,11 +47,23 @@ export interface AgentExtensions {
   spawning: Extension;
   /** `agent_send` and `agent_status`; every agent selects it. */
   messaging: Extension;
+  /** `collab_board`, `collab_claim`, `collab_send`, and `collab_peers`;
+   * only agents spawned into a collab group select it. */
+  collab: Extension;
+  /** The tools of a competition's solvers and judge. */
+  compete: Extension;
+  /** Where the session keeps its collab groups and competitions. */
+  collabBinding: CollabBinding;
   /** What the messaging tools share with the service. */
   hub: MessagingHub;
   /** The cap on agents that work at once; the host observes its harness
    * with it. */
   working?: WorkingAgents;
+  /** The pacing of model requests: rate-limit backoff and the token
+   * budget. */
+  requests: ModelRequests;
+  /** How far spawning reaches. */
+  limits: SpawningLimits;
   /** Stop running scripts, after the harness closed. */
   close(): Promise<void>;
 }
@@ -51,13 +72,20 @@ export interface AgentExtensionOptions {
   prompt: PromptOptions;
   /** Resolves the profiles, models, and skills of helpers. */
   resolveHelper: HelperResolver;
-  /** Tests only: tighter spawning limits. */
+  /** Spawning limits from settings, over the defaults. */
   spawningLimits?: Partial<SpawningLimits>;
   messaging?: MessagingOptions;
   /** How many agents work at once; unlimited when absent. */
   maxWorkingAgents?: number;
+  /** Model tokens per minute across agents; no budget when absent. */
+  maxTokensPerMinute?: number;
+  /** Sub-teams and broadcasts in collab groups. */
+  teams?: Partial<TeamLimits>;
   /** Co-loaded extensions' hooks on every agent's requests. */
   hooks?: readonly HookRegistration[];
+  /** The session and directory of collab groups and competitions; a
+   * temporary placeholder without it, for tests. */
+  collab?: CollabBinding;
 }
 
 export function createAgentExtensions(
@@ -68,21 +96,40 @@ export function createAgentExtensions(
     options.maxWorkingAgents === undefined
       ? undefined
       : new WorkingAgents(options.maxWorkingAgents);
+  const requests = new ModelRequests(
+    options.maxTokensPerMinute === undefined
+      ? {}
+      : { tokensPerMinute: options.maxTokensPerMinute },
+  );
   // Every agent selects the tools, so their hooks see every request.
-  // Extensions' hooks run before the cap's, so a held run takes no slot.
+  // Extensions' hooks run before the cap's, so a held run takes no slot;
+  // the budget and backoff pace agents the cap admitted.
   const hooks = [
     ...(extension.hooks ?? []),
     ...(options.hooks ?? []),
     ...(working?.hooks ?? []),
+    ...requests.hooks,
   ];
   const tools = hooks.length > 0 ? { ...extension, hooks } : extension;
   const prompt = createPromptExtension(options.prompt);
   const hub = new MessagingHub();
-  const limits = { ...SPAWNING_LIMITS, ...options.spawningLimits };
+  const limits = {
+    ...SPAWNING_LIMITS,
+    ...(options.teams?.teamSize ? { teamSize: options.teams.teamSize } : {}),
+    ...options.spawningLimits,
+  };
   const pause = working
     ? { pause: (agentId: string) => working.pause(agentId) }
     : {};
   const messaging = createMessagingExtension(hub, options.messaging);
+  const collabBinding = options.collab ?? detachedCollab();
+  const collab = createCollabExtension(
+    collabBinding,
+    hub,
+    options.messaging,
+    options.teams,
+  );
+  const compete = createCompeteExtension(collabBinding, hub);
   let spawning: Extension | undefined;
   const spawnTools = spawningTools({
     resolve: options.resolveHelper,
@@ -90,18 +137,23 @@ export function createAgentExtensions(
     hub,
     ...pause,
     // What a new agent selects besides its own tools.
-    selection: (spawn) => ({
-      extensions: [
-        tools,
-        prompt,
-        ...(spawn && spawning ? [spawning] : []),
-        messaging,
-      ],
-      tools: [
-        ...(spawn ? (spawning?.tools ?? []) : []),
-        ...(messaging.tools ?? []),
-      ],
-    }),
+    selection: (spawn, group) => {
+      const joined = collabSelection({ collab, compete }, group);
+      return {
+        extensions: [
+          tools,
+          prompt,
+          ...(spawn && spawning ? [spawning] : []),
+          messaging,
+          ...joined.extensions,
+        ],
+        tools: [
+          ...(spawn ? (spawning?.tools ?? []) : []),
+          ...(messaging.tools ?? []),
+          ...joined.tools,
+        ],
+      };
+    },
   });
   spawning = defineExtension({
     name: "pi-agents-spawning",
@@ -113,8 +165,13 @@ export function createAgentExtensions(
     graphs: createGraphsExtension(),
     spawning,
     messaging,
+    collab,
+    compete,
+    collabBinding,
     hub,
     ...(working ? { working } : {}),
+    requests,
+    limits,
     close,
   };
 }
@@ -129,6 +186,8 @@ export function installAgentExtensions(
     extensions.graphs,
     extensions.spawning,
     extensions.messaging,
+    extensions.collab,
+    extensions.compete,
   ])
     registry.install(extension);
 }

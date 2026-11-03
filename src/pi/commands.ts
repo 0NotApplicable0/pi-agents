@@ -18,6 +18,7 @@ import type {
   NodeOutcome,
   Stall,
 } from "../agents/types.js";
+import { collabLogSource, openCollabLog } from "../ui/collab-log.js";
 import {
   confirmAndStop,
   errorText,
@@ -516,11 +517,35 @@ export function registerCommands(pi: ExtensionAPI, deps: CommandDeps): void {
     );
 
   pi.registerCommand("messages", {
-    description: "Read the messages agents sent each other",
+    description:
+      "Interactively read queued, delivered, and dropped agent-to-agent messages, including collab_send deliveries.",
     handler: async (_args, ctx) => {
       if (!inTerminal(ctx, "/messages")) return;
       try {
         await openMessagesOverlay(ctx, deps);
+      } catch (error) {
+        notify(ctx, errorText(error), "error");
+      }
+    },
+  });
+
+  pi.registerCommand("message-board", {
+    description:
+      "Browse a collab group's retained collab_send history (terminal UI)",
+    handler: async (args, ctx) => {
+      if (!inTerminal(ctx, "/message-board")) return;
+      const root = deps.host.collabRoot();
+      if (!root) {
+        notify(ctx, "No collab groups yet.", "warning");
+        return;
+      }
+      try {
+        await openCollabLog(
+          ctx,
+          collabLogSource(root),
+          args.trim() || undefined,
+          deps.panel,
+        );
       } catch (error) {
         notify(ctx, errorText(error), "error");
       }

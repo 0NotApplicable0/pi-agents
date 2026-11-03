@@ -6,6 +6,53 @@ import {
   harnessIdentity,
 } from "../../src/host/harness-setup.js";
 
+import { readLimits, readVerifySettings } from "../../src/host/settings.js";
+
+describe("verification settings", () => {
+  test("scrubs by default and validates environment overrides", () => {
+    expect(readVerifySettings({})).toEqual({
+      mode: "scrub",
+      passthrough: [],
+      errors: [],
+    });
+    expect(
+      readVerifySettings({
+        piAgents: {
+          verifyEnv: "minimal",
+          verifyEnvPassthrough: ["CI_TOKEN", "CI_TOKEN"],
+        },
+      }),
+    ).toEqual({ mode: "minimal", passthrough: ["CI_TOKEN"], errors: [] });
+    const invalid = readVerifySettings({
+      piAgents: { verifyEnv: "unsafe", verifyEnvPassthrough: ["X=Y"] },
+    });
+    expect(invalid.mode).toBe("scrub");
+    expect(invalid.passthrough).toEqual([]);
+    expect(invalid.errors).toHaveLength(2);
+  });
+  test("environment policy comes from global settings, resource limits remain merged", () => {
+    const settings = SettingsManager.fromStorage({
+      withLock(scope, read) {
+        read(
+          JSON.stringify({
+            piAgents:
+              scope === "global"
+                ? { verifyEnv: "minimal", maxSolvers: 4 }
+                : { verifyEnv: "inherit", maxSolvers: 20 },
+          }),
+        );
+      },
+    });
+    expect(readVerifySettings(settings.getGlobalSettings()).mode).toBe(
+      "minimal",
+    );
+    expect(readLimits(settings.getSettings()).limits.maxSolvers).toBe(20);
+    expect(
+      readVerifySettings({ piAgents: { verifyEnv: "inherit" } }).mode,
+    ).toBe("inherit");
+  });
+});
+
 describe("harness settings", () => {
   test("agents compact with Pi's per-model token settings", () => {
     const settings = createHarnessSettings(

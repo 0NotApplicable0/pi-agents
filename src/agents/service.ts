@@ -46,8 +46,10 @@ import { AgentStore } from "./store.js";
 import {
   AgentError,
   type AgentInfo,
+  type CompetitionOwnership,
   type GraphInfo,
   type GraphSpec,
+  GraphStartedError,
   type MessageInfo,
   type MessageMode,
   type PendingDelivery,
@@ -323,6 +325,55 @@ export class AgentService {
       .sort((left, right) => left.createdAt - right.createdAt);
   }
 
+  /** The parent's competition owners, from durable memberships rather than
+   * competition files or the possibly stale projection. */
+  async competitionOwners(): Promise<
+    ReadonlyMap<string, CompetitionOwnership>
+  > {
+    const agents = await this.store.loadAgents();
+    const graphs = await this.store.loadGraphs();
+    const owners = new Map<string, CompetitionOwnership>();
+    for (const [agentId, record] of Object.entries(agents)) {
+      const membership = record.collab;
+      if (typeof membership?.competition !== "string" || record.depth !== 1)
+        continue;
+      let ownership = owners.get(membership.competition);
+      if (!ownership) {
+        ownership = { agents: [], graphs: [] };
+        owners.set(membership.competition, ownership);
+      }
+      ownership.agents.push({
+        agentId,
+        graph: record.graph,
+        ...(membership.part ? { part: membership.part } : {}),
+        ...(membership.solver ? { solver: membership.solver } : {}),
+        ...(membership.bracket !== undefined
+          ? { bracket: membership.bracket }
+          : {}),
+        stopped: record.stopped === true,
+      });
+    }
+    for (const [competition, ownership] of owners) {
+      for (const id of new Set(ownership.agents.map((agent) => agent.graph))) {
+        const graph = graphs[id];
+        if (
+          !graph ||
+          graph.owner ||
+          graph.nodes.length === 0 ||
+          !graph.nodes.every((node) => {
+            const record = agents[node.agent];
+            return (
+              record?.depth === 1 && record.collab?.competition === competition
+            );
+          })
+        )
+          continue;
+        ownership.graphs.push({ id, closed: graph.closed === true });
+      }
+    }
+    return owners;
+  }
+
   /** How many older messages the log dropped. */
   droppedMessages(): number {
     return this.messageLog.dropped();
@@ -456,8 +507,12 @@ export class AgentService {
    */
   async spawnGraph(spec: GraphSpec): Promise<GraphInfo> {
     const created = await createGraph(this.creation, spec);
-    await this.refresh(created.agents);
-    return this.requireGraph(created.id);
+    try {
+      await this.refresh(created.agents);
+      return this.requireGraph(created.id);
+    } catch (error) {
+      throw new GraphStartedError(created.id, created.agents, error);
+    }
   }
 
   /**
@@ -517,6 +572,11 @@ export class AgentService {
     });
     await this.refresh(this.projection.withHelpers([info.id]));
     return { agent: this.requireAgent(info.id), dropped };
+  }
+
+  /** Whether the agent was stopped; a closed agent that answered wasn't. */
+  isStopped(agentId: string): boolean {
+    return this.projection.agents()[agentId]?.stopped === true;
   }
 
   /** Message an agent on behalf of the user; results stay in the agent. */

@@ -6,6 +6,7 @@
  */
 
 import { type CheckpointInfo, defineDoc } from "@earendil-works/pi-durable";
+import type { CollabMembership } from "../collab/membership.js";
 import type { AgentExtensionState } from "../hooks.js";
 import type { GraphPolicy } from "./types.js";
 
@@ -53,6 +54,9 @@ export type AgentRecord = {
   graph: string;
   /** Whether the agent may spawn agents of its own. */
   spawn?: boolean;
+  /** Its collab group, or its part in a competition. Absent for agents
+   * created before collab groups existed and a competition's helpers. */
+  collab?: CollabMembership;
   /** How many agents started this one and its ancestors: 1 for the parent's agents. */
   depth: number;
   /** Stopped by the user or the parent, or with an agent above it, until

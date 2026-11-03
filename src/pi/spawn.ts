@@ -41,6 +41,13 @@ export interface SpawnRequest {
   skills?: string[];
   cwd?: string;
   spawn?: boolean;
+  /** Its collab group; the session's default group when unset. */
+  group?: string;
+  /** Its role in the group; the profile or name when unset. */
+  role?: string;
+  /** Its sub-team in the group, and whether it leads it. */
+  team?: string;
+  lead?: boolean;
 }
 
 /** What a spawn draws on besides its request. */
@@ -233,6 +240,17 @@ export async function resolveSpawn(
     cwd,
     ambientSkills,
     ...(spawn ? { spawn: true } : {}),
+    // Only a group and role: competitions are the parent's to start.
+    ...(request.group || request.role || request.team || request.lead
+      ? {
+          collab: {
+            ...(request.group ? { group: request.group } : {}),
+            ...(request.role ? { role: request.role } : {}),
+            ...(request.team ? { team: request.team } : {}),
+            ...(request.lead ? { lead: true } : {}),
+          },
+        }
+      : {}),
     ...(request.name ? { name: request.name } : {}),
     ...(profile ? { profile: profile.name } : {}),
     ...(model ? { model } : {}),

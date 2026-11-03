@@ -99,6 +99,52 @@ function failingHost(
   return { host, ctx, cwd, notes, directory, fail };
 }
 
+describe("limits from settings", () => {
+  test("default to 12 per spawn and 32 working agents", async () => {
+    const { host, ctx, cwd } = failingHost();
+    await host.start(ctx);
+    const service = await host.ensure(ctx);
+    expect(host.limits()).toMatchObject({
+      maxAgentsPerSpawn: 12,
+      maxWorkingAgents: 32,
+    });
+    await expect(
+      service.spawnGraph({
+        agents: Array.from({ length: 13 }, (_, index) => ({
+          job: "one",
+          name: `w${index}`,
+          cwd,
+          model: MODEL,
+        })),
+      }),
+    ).rejects.toThrow("piAgents.maxAgentsPerSpawn");
+  });
+
+  test("piAgents settings raise them, and 0 turns the working cap off", async () => {
+    const { host, ctx, cwd } = failingHost();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(
+      path.join(cwd, ".pi", "settings.json"),
+      JSON.stringify({
+        piAgents: { maxAgentsPerSpawn: 20, maxSolvers: 8, maxWorkingAgents: 0 },
+      }),
+    );
+    await host.start(ctx);
+    const service = await host.ensure(ctx);
+    expect(host.limits()).toMatchObject({
+      maxAgentsPerSpawn: 20,
+      maxSolvers: 8,
+    });
+    expect(host.limits().maxWorkingAgents).toBeUndefined();
+    const names = Array.from({ length: 20 }, (_, index) => `w${index}`);
+    await service.spawnGraph({
+      agents: names.map((name) => ({ job: "one", name, cwd, model: MODEL })),
+    });
+    await service.wait(names);
+    expect(service.get("w19")?.result?.text).toBe("done: one");
+  });
+});
+
 describe("storage failures", () => {
   test("pause agents and reopen their storage", async () => {
     const { host, ctx, cwd, notes, fail } = failingHost();

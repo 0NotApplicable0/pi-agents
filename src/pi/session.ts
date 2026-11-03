@@ -19,6 +19,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   type ExtensionAPI,
@@ -32,6 +33,11 @@ import type { Parent } from "../agents/parent.js";
 import { AgentService } from "../agents/service.js";
 import { AgentError } from "../agents/types.js";
 import { SkillCatalog } from "../catalog/skills.js";
+import {
+  configureVerifyConcurrency,
+  configureVerifyEnv,
+} from "../collab/compete.js";
+import { configureRetention } from "../collab/store.js";
 import type { AgentHooks } from "../hooks.js";
 import { type AgentHarness, openAgentHarness } from "../host/harness.js";
 import {
@@ -42,8 +48,13 @@ import { beforeRequestHooks } from "../host/hooks.js";
 import { acquireLock, type StorageLock } from "../host/lock.js";
 import { resolveModels } from "../host/models.js";
 import { pruneSessions, readRetention } from "../host/retention.js";
+import {
+  DEFAULT_LIMITS,
+  type Limits,
+  readLimits,
+  readVerifySettings,
+} from "../host/settings.js";
 import { openStorage, type Storage } from "../host/storage.js";
-import { readWorkingLimit } from "../host/working.js";
 import { captureAgentState, discoverAgentHooks } from "./hooks.js";
 import { notify } from "./notify.js";
 import { isTrusted, resolveHelper } from "./spawn.js";
@@ -54,6 +65,17 @@ function sessionsRoot(): string {
 
 function sessionDirectory(sessionId: string): string {
   return path.join(sessionsRoot(), sessionId);
+}
+
+/** Where a session keeps its collab groups and competitions: with its
+ * storage, or in a temporary directory for a session without storage. */
+export function collabDirectory(
+  sessionId: string,
+  persistent: boolean,
+): string {
+  return persistent
+    ? path.join(sessionDirectory(sessionId), "collab")
+    : path.join(os.tmpdir(), "pi-agents-collab", sessionId);
 }
 
 /** How soon after a storage failure the host reopens again by itself. */
@@ -79,6 +101,8 @@ export class SessionHost {
   private opening: Promise<AgentService> | undefined;
   private lock: StorageLock | undefined;
   private sessionId: string | undefined;
+  private collabDir: string | undefined;
+  private settingsLimits: Limits | undefined;
   private ctx: ExtensionContext | undefined;
   private unsubscribe: (() => void) | undefined;
   private readonly listeners = new Set<() => void>();
@@ -171,6 +195,16 @@ export class SessionHost {
     this.trusted = isTrusted(ctx);
   }
 
+  /** The limits from settings, read when the service opens. */
+  limits(): Limits {
+    return this.settingsLimits ?? { ...DEFAULT_LIMITS };
+  }
+
+  /** The session's collab directory, once the service opened. */
+  collabRoot(): string | undefined {
+    return this.collabDir;
+  }
+
   /** The open service, if any. */
   current(): AgentService | undefined {
     return this.service;
@@ -198,6 +232,8 @@ export class SessionHost {
     await this.closing;
     const sessionId = this.sessionId ?? fallback;
     this.sessionId = sessionId;
+    const collabDir = collabDirectory(sessionId, persistent);
+    this.collabDir = collabDir;
     let lock: StorageLock | undefined;
     let storage: Storage;
     if (persistent) {
@@ -229,13 +265,50 @@ export class SessionHost {
     };
     try {
       const settingsManager = SettingsManager.create(cwd, getAgentDir());
-      const { limit, error } = readWorkingLimit(settingsManager.getSettings());
-      if (error) this.report(new Error(`${error}; agents aren't capped`));
+      const { limits, errors } = readLimits(settingsManager.getSettings());
+      for (const error of errors)
+        this.report(new Error(`${error}; the default applies`));
+      this.settingsLimits = limits;
       const models = await resolveModels(modelRegistry);
+      configureRetention({
+        messages: limits.collabRetainMessages,
+        finishedEntries: limits.collabRetainFinished,
+        closedTasks: limits.collabRetainClosedTasks,
+      });
+      configureVerifyConcurrency(limits.verifyConcurrency);
+      // Environment opt-outs must not be supplied by a checked-out project.
+      // Resource limits intentionally retain Pi's current merged settings.
+      const verifySettings = readVerifySettings(
+        settingsManager.getGlobalSettings(),
+      );
+      for (const error of verifySettings.errors)
+        this.report(new Error(`${error}; the default applies`));
+      configureVerifyEnv(verifySettings.mode, verifySettings.passthrough);
       const extensions = createAgentExtensions({
-        ...(limit === undefined ? {} : { maxWorkingAgents: limit }),
+        ...(limits.maxWorkingAgents === undefined
+          ? {}
+          : { maxWorkingAgents: limits.maxWorkingAgents }),
+        ...(limits.maxTokensPerMinute === undefined
+          ? {}
+          : { maxTokensPerMinute: limits.maxTokensPerMinute }),
+        teams: {
+          teamSize: limits.teamSize,
+          maxBroadcast: limits.maxBroadcast,
+          broadcastsPerMinute: limits.broadcastsPerMinute,
+        },
+        spawningLimits: {
+          perCall: limits.maxAgentsPerSpawn,
+          perAgent: limits.maxSpawnedPerAgent,
+          active: limits.maxActiveSpawned,
+          depth: limits.maxDepth,
+          teamSize: limits.teamSize,
+        },
         hooks: beforeRequestHooks(sessionId, this.hooks),
         prompt: { trusted: () => this.trusted, skills: this.skills.get },
+        collab: {
+          sessionId: () => sessionId,
+          root: () => collabDir,
+        },
         resolveHelper: (request, defaults) => {
           const current = this.ctx;
           if (!current) throw new AgentError("Pi isn't ready for helpers yet");

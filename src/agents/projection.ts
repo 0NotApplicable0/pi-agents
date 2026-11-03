@@ -368,6 +368,7 @@ export class Projection {
       ...(jobAnswer !== undefined ? { jobAnswer } : {}),
       graph: record.graph,
       ...(record.spawn ? { spawn: true } : {}),
+      ...(record.collab ? { collab: record.collab } : {}),
       ...(group?.owner ? { owner: group.owner.agent } : {}),
     });
     return delivered;

@@ -103,7 +103,7 @@ names include their spawner's name, such as
   them the way Pi does.
 - They may spawn agents of their own only when their agent asks for it.
   Agents nest at most three levels deep: Pi's agents, theirs, and those
-  agents' agents, which can't spawn.
+  agents' agents, which can't spawn (the `piAgents.maxDepth` setting).
 - An agent can message the agent that spawned it, the agents spawned with
   it, and the agents it spawned. Pi's agents can message each other.
 - Esc on an agent corrects it and leaves its agents working. Their results
@@ -121,5 +121,7 @@ names include their spawner's name, such as
 - At most 16 spawned agents have unfinished initial jobs at once in a
   session, including those still waiting on `after` dependencies. Later
   messages to agents whose initial jobs finished don't count toward this
-  limit. The optional [working-agent cap](./configuration.md#working-agents)
+  limit. The [working-agent cap](./configuration.md#working-agents)
   applies to those later turns too.
+- [Settings](./configuration.md#spawning-limits) raise each of these
+  limits, for example for a lead agent that runs a team of 100.

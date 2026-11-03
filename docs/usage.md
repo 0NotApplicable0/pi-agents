@@ -15,6 +15,8 @@ Ask Pi to start agents: [see the example prompts](../README.md#-usage).
 | Group | One spawn's runtime-owned set of agents, with one result for whoever spawned it. A group of one looks like its agent, but has a separate group ID. |
 | Graph | The `after` dependencies within a group: some agents run in parallel, others start after their inputs finish. |
 | Spawned agent | An agent that another agent started for part of its job. Its group's result goes to that agent, not to Pi. |
+| Collab group | The agents of a session that work as a team: a shared blackboard, file claims, and structured messages. Every agent is in one, `main` unless its spawn names another. See [Working together](collab.md). |
+| Competition | Several agents solving the same task blind to each other, each in its own workspace, compared by a verify command and a judge. See [competitions](collab.md#competitions). |
 | Profile | Reusable settings for agents, such as model, thinking level, tools, and instructions. |
 | Attach | Open an agent's conversation to watch it and talk to it. |
 | Stop | End an agent or group and remove it from the panel. Agents end on their own once their answer reaches their owner. Messaging an agent that ended starts it again. |
@@ -62,6 +64,11 @@ Agents use `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and
 [skills](#skills). They inherit your active tools from this set unless a
 profile or spawn specifies others. They can't use MCP servers or tools
 from other extensions.
+
+Every agent also has the [collab tools](collab.md#collab-groups) of its
+group, `collab_board`, `collab_claim`, `collab_send`, and `collab_peers`,
+and is told to use the board and claims when others work alongside it. A
+competition's agents have their own tools instead.
 
 `read` supports images. Codemode scripts can call the agent's other tools,
 except `agent_wait`, which the agent's model must call directly. Scripts get
@@ -205,7 +212,11 @@ the new session.
 | --- | --- |
 | `/agents` | Browse all agents and graphs, including ended ones, with their jobs and latest results. Attach to, fold, retry, or stop them. |
 | `/agent <name>` | Attach to an agent. |
-| `/messages` | Read and filter the messages agents sent each other, newest first. |
+| `/messages` | Interactively read and filter all agent-to-agent messages, including queued and dropped messages, newest first. |
+| `/collab` | Show this session's [collab groups](collab.md), including members, claims, tasks, board, and recent messages. |
+| `/collab messages` | Read the group's `collab_send` log, latest 50 messages. |
+| `/message-board [group]` | Interactively browse and search one collab group's retained `collab_send` history in the terminal UI. Defaults to `main` (or the first existing group); Tab switches groups. |
+| `/compete` | Start, list, compare, apply, or discard [competitions](collab.md#competitions). |
 
 ## Tools
 
@@ -213,14 +224,19 @@ Pi uses these tools to work with agents:
 
 | Tool | Purpose |
 | --- | --- |
-| `agent_spawn` | Start one group of 1 to 12 agents, optionally with `after` dependencies or permission to spawn. |
+| `agent_spawn` | Start one group of 1 to 12 agents ([configurable](configuration.md#spawning-limits)), optionally with `after` dependencies or permission to spawn. |
 | `agent_send` | Message an agent: prompt, steer, queue a follow-up, or interrupt its work first. |
 | `agent_wait` | Block until agents or groups answer and return their results. |
 | `agent_status` | Show agent and group states. |
 | `agent_stop` | Stop an agent or a group. |
+| `agent_compete` | Run a [competition](collab.md#competitions): blind solvers, verify, judge; apply a winner on request. |
+| `collab_status` | Read this session's [collab groups](collab.md). |
 
 `agent_spawn` always takes an `agents` list, even for one agent. Each entry
-uses `job` for its instructions and may set `spawn: true` to permit children.
+uses `job` for its instructions and may set `spawn: true` to permit children,
+and `group` and `role` to choose its [collab group](collab.md) (`main`, or
+the spawner's) and how others address it (`role:<role>`), and `team` and
+`lead` for its [sub-team](collab.md#sub-teams).
 Use `after` with names from the same call to make a dependency graph:
 
 ```json

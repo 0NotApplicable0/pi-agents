@@ -140,6 +140,23 @@ describe("resolveSpawn", () => {
     expect(spec.tools).toEqual(["read", "grep"]);
   });
 
+  test("a group and role are plain attributes of a spawn", async () => {
+    const cwd = project();
+    const options = { skills: discoverSkills, thinking: "high" } as const;
+    expect(
+      (await resolveSpawn({ job: "x" }, context(cwd), options)).collab,
+    ).toBeUndefined();
+    expect(
+      (
+        await resolveSpawn(
+          { job: "x", group: "docs", role: "writer" },
+          context(cwd),
+          options,
+        )
+      ).collab,
+    ).toEqual({ group: "docs", role: "writer" });
+  });
+
   test("reports unknown profiles, skills, models, and directories", async () => {
     const cwd = project();
     expect(

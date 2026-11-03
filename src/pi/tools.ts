@@ -33,6 +33,12 @@ import {
   THINKING_LEVELS,
   WaitInterrupted,
 } from "../agents/types.js";
+import {
+  groupParameter,
+  leadParameter,
+  roleParameter,
+  teamParameter,
+} from "../collab/schema.js";
 import { AGENT_TOOL_NAMES } from "../host/tools.js";
 import { graphShape, oneLine } from "../ui/format.js";
 import { PARENT_TOOL_VIEWS, positiveSeconds } from "../ui/tool-views.js";
@@ -429,6 +435,10 @@ const agentFields = {
         "Let this agent spawn agents of its own, which report back to it. Default false",
     }),
   ),
+  group: groupParameter,
+  role: roleParameter,
+  team: teamParameter,
+  lead: leadParameter,
 };
 
 function describeTarget(service: AgentService, target: Target): string {
@@ -457,9 +467,8 @@ export function registerAgentTools(pi: ExtensionAPI, host: SessionHost): void {
       }),
       {
         minItems: GRAPH_SIZE.min,
-        maxItems: GRAPH_SIZE.max,
         description:
-          'Always an array, one entry per agent with its fields, also for a single agent: {"agents": [{"name": "lead", "job": "...", "spawn": true}]}',
+          'Always an array, one entry per agent with its fields, also for a single agent: {"agents": [{"name": "lead", "job": "...", "spawn": true}]}. At most 12 per call unless the piAgents.maxAgentsPerSpawn setting raised the limit',
       },
     ),
     failFast: Type.Optional(
@@ -472,7 +481,7 @@ export function registerAgentTools(pi: ExtensionAPI, host: SessionHost): void {
     defineAgentTool(host, {
       name: "agent_spawn",
       description:
-        "Start one group of agents and return at once. Once all finished, the group's result arrives as one message that starts a new turn: the final messages of the agents that no other agent lists in after. For one merged answer, add an agent after the others that merges their results; for results that should arrive separately, call agent_spawn once per job.",
+        "Start one group of agents and return at once. Once all finished, the group's result arrives as one message that starts a new turn: the final messages of the agents that no other agent lists in after. For one merged answer, add an agent after the others that merges their results; for results that should arrive separately, call agent_spawn once per job. Every agent joins this session's collab group (\"main\" unless it names a group) with a shared blackboard, file claims, and structured messages (collab_* tools); give agents a role so they can address each other, and tell agents that work on the same files to coordinate there. collab_status shows the group.",
       parameters: spawnParams,
       prepare: checkSpawnShape,
       output: GraphOutput,
