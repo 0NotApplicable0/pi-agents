@@ -212,8 +212,10 @@ the new session.
 | --- | --- |
 | `/agents` | Browse all agents and graphs, including ended ones, with their jobs and latest results. Attach to, fold, retry, or stop them. |
 | `/agent <name>` | Attach to an agent. |
-| `/messages` | Read and filter the messages agents sent each other, newest first. |
-| `/collab` | Show this session's [collab groups](collab.md): members, claims, tasks, board, messages. |
+| `/messages` | Interactively read and filter all agent-to-agent messages, including queued and dropped messages, newest first. |
+| `/collab` | Show this session's [collab groups](collab.md), including members, claims, tasks, board, and recent messages. |
+| `/collab messages` | Read the group's `collab_send` log, latest 50 messages. |
+| `/message-board [group]` | Interactively browse and search one collab group's retained `collab_send` history in the terminal UI. Defaults to `main` (or the first existing group); Tab switches groups. |
 | `/compete` | Start, list, compare, apply, or discard [competitions](collab.md#competitions). |
 
 ## Tools

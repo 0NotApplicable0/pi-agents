@@ -8,9 +8,12 @@ requests) with the others. And when you want independent attempts rather
 than teamwork, a competition has several agents solve the same task blind
 to each other and compares their solutions.
 
-- **Collab groups**: the blackboard, claims, and messages of the agents
-  that work together. Pi reads them with `collab_status`, you with
-  `/collab`.
+- **Collab groups**: the blackboard, claims, tasks, and recent messages of
+  agents that work together. Pi reads them with `collab_status`, you with
+  `/collab`. `/collab messages` shows the latest 50 entries in the group's
+  structured `collab_send` log; [`/messages`](messaging.md) shows the
+  interactive agent-to-agent stream, including queued, delivered, and dropped
+  messages.
 - **Competitions**: `agent_compete` (or `/compete <task>`) runs 2–6 solvers
   (`piAgents.maxSolvers` raises the limit)
   on one task, each in its own Git worktree or copy, blind to each other. A
@@ -121,6 +124,7 @@ Recent messages (3)
 ```
 
 ```text
+/collab              group overview: members, claims, tasks, board, recent messages
 /collab board        every entry with its body, finished ones too
 /collab claims       who holds what
 /collab tasks        each task and its latest state, ✓ when done
@@ -128,6 +132,31 @@ Recent messages (3)
 /collab groups       the session's groups
 /collab docs board   another group's board
 ```
+
+For an interactive, read-only view, open `/message-board` or
+`/message-board docs`. It starts in `main` when available, otherwise the
+first existing group. Tab and Shift+Tab switch groups, checking the current
+group list each time. This dialog needs Pi's terminal UI; RPC clients cannot
+render it.
+
+The dialog shows the newest 200 `collab_send` entries first. Use ↑↓ or
+Page Up/Down to move, Enter to read the selected message (including its
+type, task, mode, and references), and Shift+↑↓ to scroll its text. Moving
+past the oldest loaded entry loads more when no filter is active; Ctrl+L
+loads older history on demand. Type to filter loaded entries by text,
+names, type, task, or references. With a filter active, use Ctrl+L to extend
+the search rather than arrow keys. End progressively loads the remaining
+retained history and selects the oldest matching message, yielding between
+loads; any key cancels this loading. Home selects the newest loaded match.
+Ctrl+R refreshes the selected group's log. Read failures appear in the
+dialog without discarding the last successful view. Esc closes the reading
+pane, then clears the filter, then closes the dialog.
+
+This reaches the group's **retained** history, not messages already pruned
+by [retention settings](configuration.md). `/messages` remains a separate
+view of agent-to-agent deliveries, including queued and dropped messages;
+`/message-board` reads the structured group log, not delivery status or the
+blackboard's findings and decisions.
 
 Pi itself can read the same with the `collab_status` tool, so you can ask
 "what has the team decided so far?".

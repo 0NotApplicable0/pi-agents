@@ -70,8 +70,11 @@ graph, agents pass results to each other and Pi gets one message at the end.
 The agents of a session are a team. Every agent is in the session's collab
 group: it shares a blackboard of findings, decisions, questions, and todos
 with the others, claims files before it changes them, and hands off work
-and asks for reviews with structured messages. Give agents roles, or a
-group of their own, and watch them with `/collab`.
+and asks for reviews with structured messages. Use `/collab` to see group
+coordination, including recent messages; `/collab messages` shows the latest
+50 entries in the group's structured log. For the interactive stream,
+including queued, delivered, and dropped agent messages, see
+[`/messages`](docs/messaging.md). Give agents roles, or a group of their own.
 
 ```text
 Spawn an implementer and a reviewer: the implementer adds input validation
@@ -80,7 +83,8 @@ first; the reviewer waits for a review request and answers it.
 ```
 
 ```text
-/collab              members, claims, open tasks, latest board entries
+/collab              group overview: members, claims, tasks, board, recent messages
+/collab messages     latest 50 entries in the group's structured collab_send log
 /collab board        the whole blackboard
 /collab tasks        task_req/handoff/review_req and their answers
 ```

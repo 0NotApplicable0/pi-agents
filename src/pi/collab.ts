@@ -1366,7 +1366,7 @@ export function registerCollab(
 
   pi.registerCommand("collab", {
     description:
-      "Show this session's collab groups: /collab [group] [board|claims|tasks|messages|groups]",
+      "Show groups' boards, claims, tasks, and recent messages. /collab messages shows the group's latest 50 collab_send messages.",
     getArgumentCompletions: (prefix) => {
       const words = ["board", "claims", "tasks", "messages", "groups"].filter(
         (word) => word.startsWith(prefix),

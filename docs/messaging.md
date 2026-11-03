@@ -34,7 +34,9 @@ The focused panel shows queued messages. Use ↑↓ to select one, ⏎ to
 attach to its recipient, or `m` to open `/messages` at that message.
 On an agent row, `m` filters messages by that agent's name.
 
-`/messages` shows every message in one stream, newest first, one line each:
+`/messages` interactively shows all agent-to-agent messages, including those
+queued or dropped and those sent through `collab_send`, newest first, one line
+each:
 
 ```text
 ╭─ Messages (3) ───────────────────────────────────────────────────────╮
