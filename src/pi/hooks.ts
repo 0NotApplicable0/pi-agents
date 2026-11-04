@@ -24,6 +24,9 @@ export interface AgentHookDiscovery {
   hooks: readonly AgentHooks[];
   /** Why registrations were ignored, for one notice. */
   problems: string[];
+  /** Set when a `beforeAgentTool` registration was lost or unconfirmed: the
+   * host must then block every agent tool call rather than run ungated. */
+  toolDenial?: string;
 }
 
 /** A short, printable name for a namespace that may be anything. */
@@ -47,6 +50,7 @@ export function discoverAgentHooks(
   let collecting = true;
   const request: AgentHooksDiscovery = {
     protocol: 1,
+    capabilities: Object.freeze({ beforeAgentTool: 1 as const }),
     register: (hooks) => {
       if (collecting) collected.push(hooks);
     },
@@ -61,20 +65,41 @@ export function discoverAgentHooks(
     collecting = false;
   }
   const valid: AgentHooks[] = [];
+  const denial: { reason?: string } = {};
+  const deny = (reason: string) => {
+    denial.reason ??= reason;
+  };
   for (const value of collected) {
     const candidate = (
       typeof value === "object" && value !== null ? value : {}
     ) as Partial<AgentHooks>;
-    const { namespace, onAgentCreate, onAgentRequest, beforeAgentRequest } =
-      candidate;
+    const {
+      namespace,
+      onAgentCreate,
+      onAgentRequest,
+      beforeAgentRequest,
+      beforeAgentTool,
+      onAgentToolRegistration,
+    } = candidate;
     if (
       typeof namespace !== "string" ||
       !NAMESPACE.test(namespace) ||
-      [onAgentCreate, onAgentRequest, beforeAgentRequest].some(
+      [
+        onAgentCreate,
+        onAgentRequest,
+        beforeAgentRequest,
+        beforeAgentTool,
+        onAgentToolRegistration,
+      ].some(
         (callback) => callback !== undefined && typeof callback !== "function",
       )
     ) {
       problems.push(`invalid registration ${label(namespace)}`);
+      if (
+        candidate.beforeAgentTool !== undefined ||
+        candidate.onAgentToolRegistration !== undefined
+      )
+        deny(`invalid tool approval registration ${label(namespace)}`);
       continue;
     }
     valid.push(
@@ -83,6 +108,8 @@ export function discoverAgentHooks(
         onAgentCreate,
         onAgentRequest,
         beforeAgentRequest,
+        beforeAgentTool,
+        onAgentToolRegistration,
       }),
     );
   }
@@ -90,13 +117,52 @@ export function discoverAgentHooks(
   for (const hook of valid)
     counts.set(hook.namespace, (counts.get(hook.namespace) ?? 0) + 1);
   for (const [namespace, count] of counts)
-    if (count > 1) problems.push(`duplicate namespace ${label(namespace)}`);
+    if (count > 1) {
+      problems.push(`duplicate namespace ${label(namespace)}`);
+      if (
+        valid.some(
+          (hook) => hook.namespace === namespace && hook.beforeAgentTool,
+        )
+      )
+        deny(`duplicate tool approval namespace ${label(namespace)}`);
+    }
   const hooks = valid
     .filter((hook) => counts.get(hook.namespace) === 1)
     .sort((a, b) =>
       a.namespace < b.namespace ? -1 : a.namespace > b.namespace ? 1 : 0,
     );
-  return { hooks: Object.freeze(hooks), problems };
+  // Tell every registrant, synchronously, before agents resume. A
+  // registration that wants tool approval is accepted only if every
+  // registration of it is: otherwise all tool calls are blocked.
+  for (const hook of valid) {
+    const unique = counts.get(hook.namespace) === 1;
+    const accepted = unique && denial.reason === undefined;
+    try {
+      hook.onAgentToolRegistration?.(
+        Object.freeze(
+          accepted
+            ? { accepted }
+            : {
+                accepted,
+                reason: unique
+                  ? "tool calls are blocked"
+                  : "duplicate namespace",
+              },
+        ),
+      );
+    } catch (error) {
+      problems.push(
+        `registration callback ${label(hook.namespace)} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (hook.beforeAgentTool)
+        deny(`tool approval acknowledgement ${label(hook.namespace)} failed`);
+    }
+  }
+  return {
+    hooks: Object.freeze(hooks),
+    problems,
+    ...(denial.reason ? { toolDenial: denial.reason } : {}),
+  };
 }
 
 /**
