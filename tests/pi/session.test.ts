@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Storage } from "@earendil-works/pi-durable";
+import type { AgentHooksDiscovery } from "../../src/hooks.js";
 import { lockHolder } from "../../src/host/lock.js";
 import { openStorage } from "../../src/host/storage.js";
 import { notify } from "../../src/pi/notify.js";
@@ -34,6 +35,11 @@ function failingHost(
     memory?: boolean;
     /** Resolves before each storage open after the first. */
     beforeReopen?: () => Promise<void>;
+    events?: ConstructorParameters<typeof SessionHost>[1] extends infer O
+      ? O extends { events?: infer E }
+        ? E
+        : never
+      : never;
   } = {},
 ) {
   const { models } = createFaux();
@@ -74,6 +80,7 @@ function failingHost(
   } as unknown as ExtensionContext;
   let opens = 0;
   const host = new SessionHost(new TestParent(), {
+    ...(options.events ? { events: options.events } : {}),
     openStorage: async (directory) => {
       if (++opens > 1) await options.beforeReopen?.();
       return failing(await openStorage(directory));
@@ -142,6 +149,26 @@ describe("limits from settings", () => {
     });
     await service.wait(names);
     expect(service.get("w19")?.result?.text).toBe("done: one");
+  });
+});
+
+describe("tool gate registration", () => {
+  test("a lost gate leaves agents unavailable instead of resuming ungated", async () => {
+    const { host, ctx, notes } = failingHost({
+      events: {
+        emit: (_name: string, message: unknown) => {
+          for (const _ of [1, 2])
+            (message as AgentHooksDiscovery).register({
+              namespace: "approvals",
+              beforeAgentTool: () => undefined,
+            });
+        },
+      },
+    });
+    await host.start(ctx);
+    await expect(host.ensure(ctx)).rejects.toThrow("cannot be gated");
+    expect(host.current()).toBeUndefined();
+    expect(notes.join("\n")).toContain("approvals");
   });
 });
 

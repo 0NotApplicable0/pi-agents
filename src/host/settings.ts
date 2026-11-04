@@ -206,3 +206,35 @@ export function readLimits(settings: unknown): {
   // An object error repeats per key; report it once.
   return { limits, errors: [...new Set(errors)] };
 }
+
+/**
+ * Namespaces whose `beforeAgentTool` gate must be registered for agents to
+ * work, read from global (trusted) settings only. Absent means no
+ * requirement. Anything malformed is reported and treated as a requirement
+ * nobody can meet, so agents fail closed.
+ */
+export function readRequiredToolGates(settings: unknown): {
+  namespaces: string[];
+  errors: string[];
+} {
+  const section =
+    typeof settings === "object" && settings !== null
+      ? (settings as Record<string, unknown>)[SETTINGS_KEY]
+      : undefined;
+  if (section === undefined) return { namespaces: [], errors: [] };
+  if (typeof section !== "object" || section === null || Array.isArray(section))
+    return { namespaces: [], errors: [`${SETTINGS_KEY} must be an object`] };
+  const value = (section as Record<string, unknown>).requiredToolGateNamespaces;
+  if (value === undefined) return { namespaces: [], errors: [] };
+  if (
+    Array.isArray(value) &&
+    value.every((name) => typeof name === "string" && name.length > 0)
+  )
+    return { namespaces: [...new Set(value as string[])], errors: [] };
+  return {
+    namespaces: [],
+    errors: [
+      `${SETTINGS_KEY}.requiredToolGateNamespaces must be an array of namespaces`,
+    ],
+  };
+}

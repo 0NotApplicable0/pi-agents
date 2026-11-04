@@ -52,9 +52,11 @@ import {
   DEFAULT_LIMITS,
   type Limits,
   readLimits,
+  readRequiredToolGates,
   readVerifySettings,
 } from "../host/settings.js";
 import { openStorage, type Storage } from "../host/storage.js";
+import { requiredGateDenial, ToolGate } from "../host/tool-hooks.js";
 import { captureAgentState, discoverAgentHooks } from "./hooks.js";
 import { notify } from "./notify.js";
 import { isTrusted, resolveHelper } from "./spawn.js";
@@ -108,6 +110,8 @@ export class SessionHost {
   private readonly listeners = new Set<() => void>();
   private trusted = true;
   private hooks: readonly AgentHooks[] = [];
+  /** Set when a tool approval registration failed: block every tool call. */
+  private toolDenial: string | undefined;
   private pruned = false;
   /** Whether the open storage persists, so a failure can reopen it. */
   private persistent = false;
@@ -143,10 +147,11 @@ export class SessionHost {
       ? discoverAgentHooks(this.options.events)
       : { hooks: [], problems: [] };
     this.hooks = discovered.hooks;
+    this.toolDenial = discovered.toolDenial;
     if (discovered.problems.length > 0)
       notify(
         ctx,
-        `pi-agents: ignored agent extension hooks: ${discovered.problems.join("; ")}`,
+        `pi-agents: ignored agent extension hooks: ${discovered.problems.join("; ")}${discovered.toolDenial ? `; agents are unavailable (${discovered.toolDenial})` : ""}`,
       );
     if (isPersistent(ctx) && fs.existsSync(sessionDirectory(this.sessionId))) {
       try {
@@ -284,6 +289,26 @@ export class SessionHost {
       for (const error of verifySettings.errors)
         this.report(new Error(`${error}; the default applies`));
       configureVerifyEnv(verifySettings.mode, verifySettings.passthrough);
+      // Trusted, global-only: once an approval extension is required, agents
+      // (also persisted ones that resume) never run without its gate.
+      const required = readRequiredToolGates(
+        settingsManager.getGlobalSettings(),
+      );
+      for (const error of required.errors) this.report(new Error(error));
+      const missing = requiredGateDenial(
+        required.namespaces,
+        this.hooks,
+        required.errors,
+      );
+      // Open nothing and resume nothing: a call recorded past its gate may
+      // continue after a restart without asking the gate again, so an
+      // ungated session must not start its stored agents at all.
+      const denial = this.toolDenial ?? missing;
+      if (denial)
+        throw new AgentError(
+          `Agents are unavailable because their tool calls cannot be gated: ${denial}`,
+        );
+      const toolGate = new ToolGate(sessionId, this.hooks, denial, cwd);
       const extensions = createAgentExtensions({
         ...(limits.maxWorkingAgents === undefined
           ? {}
@@ -303,7 +328,11 @@ export class SessionHost {
           depth: limits.maxDepth,
           teamSize: limits.teamSize,
         },
-        hooks: beforeRequestHooks(sessionId, this.hooks),
+        // The gate first: a blocked call never reaches other hooks' work.
+        hooks: [
+          ...toolGate.hooks,
+          ...beforeRequestHooks(sessionId, this.hooks),
+        ],
         prompt: { trusted: () => this.trusted, skills: this.skills.get },
         collab: {
           sessionId: () => sessionId,
@@ -323,6 +352,7 @@ export class SessionHost {
         extensions,
         settings: createHarnessSettings(settingsManager),
         lifecycle: { sessionId, hooks: this.hooks },
+        toolGate,
         onReport,
       });
       service = await AgentService.start({

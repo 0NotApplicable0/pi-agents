@@ -27,6 +27,7 @@ import type { HarnessReport } from "../agents/failures.js";
 import type { AgentHooks } from "../hooks.js";
 import { ExecutionEnvs } from "./harness-setup.js";
 import { AgentRequestHooks } from "./hooks.js";
+import type { ToolGate } from "./tool-hooks.js";
 
 const CONTEXT = BACKGROUND_CONTEXT;
 
@@ -41,6 +42,9 @@ export interface AgentHarnessOptions {
   extensions: AgentExtensions;
   settings?: HarnessSettings;
   lifecycle?: { sessionId: string; hooks: readonly AgentHooks[] };
+  /** Reads the context of tool calls; its hooks must be among those of
+   * `extensions`. Bound before work can resume. */
+  toolGate?: ToolGate;
   onReport?: (report: HarnessReport) => void;
 }
 
@@ -119,6 +123,7 @@ export async function openAgentHarness(
       },
       CONTEXT,
     );
+    options.toolGate?.bind(harness);
     await requests?.start(harness);
     // Before any work starts, so the cap sees every run end.
     unobserve = options.extensions.working?.observe(harness);
@@ -133,6 +138,7 @@ export async function openAgentHarness(
           await opened.close(CONTEXT);
         } finally {
           unobserve?.();
+          options.toolGate?.unbind();
           requests?.dispose();
           try {
             await envs.cleanup(CONTEXT);
@@ -147,6 +153,7 @@ export async function openAgentHarness(
       await harness?.close(CONTEXT);
     } finally {
       unobserve?.();
+      options.toolGate?.unbind();
       requests?.dispose();
       try {
         await envs.cleanup(CONTEXT);

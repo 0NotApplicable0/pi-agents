@@ -119,3 +119,137 @@ describe("agent hook discovery and capture", () => {
     });
   });
 });
+
+describe("beforeAgentTool discovery", () => {
+  test("advertises the capability and acknowledges registrations synchronously", () => {
+    const events = createEventBus();
+    const acks: Record<string, unknown> = {};
+    let capabilities: unknown;
+    events.on(AGENT_HOOKS_DISCOVER, (message) => {
+      const discovery = message as AgentHooksDiscovery;
+      capabilities = discovery.capabilities;
+      discovery.register({
+        namespace: "good",
+        beforeAgentTool: () => undefined,
+        onAgentToolRegistration: (result) => {
+          acks.good = result;
+        },
+      });
+      for (const copy of [1, 2])
+        discovery.register({
+          namespace: "twin",
+          beforeAgentTool: () => undefined,
+          onAgentToolRegistration: (result) => {
+            acks[`twin${copy}`] = result;
+          },
+        });
+      discovery.register({
+        namespace: "bad",
+        beforeAgentTool: "no" as never,
+      });
+    });
+    const { hooks, problems } = discoverAgentHooks(events);
+    expect(capabilities).toEqual({ beforeAgentTool: 1 });
+    expect(hooks.map((hook) => hook.namespace)).toEqual(["good"]);
+    // The duplicate and invalid registrations block all tools, so none is accepted.
+    expect(acks.good).toMatchObject({ accepted: false });
+    expect(acks.twin1).toMatchObject({ accepted: false });
+    expect(acks.twin2).toMatchObject({ accepted: false });
+    expect(problems.some((each) => each.includes("bad"))).toBe(true);
+  });
+
+  test("a clean registration is acknowledged as accepted", () => {
+    let ack: unknown;
+    discoverAgentHooks({
+      emit: (_name, message) =>
+        (message as AgentHooksDiscovery).register({
+          namespace: "good",
+          beforeAgentTool: () => undefined,
+          onAgentToolRegistration: (result) => {
+            ack = result;
+          },
+        }),
+    });
+    expect(ack).toEqual({ accepted: true });
+  });
+
+  test("a throwing acknowledgement is reported, not fatal", () => {
+    const events = createEventBus();
+    events.on(AGENT_HOOKS_DISCOVER, (message) => {
+      (message as AgentHooksDiscovery).register({
+        namespace: "x",
+        onAgentToolRegistration: () => {
+          throw new Error("nope");
+        },
+      });
+    });
+    const { hooks, problems } = discoverAgentHooks(events);
+    expect(hooks).toHaveLength(1);
+    expect(problems[0]).toContain("nope");
+  });
+});
+
+describe("beforeAgentTool registration failures deny tools", () => {
+  const discover = (
+    register: (discovery: AgentHooksDiscovery) => void,
+  ): ReturnType<typeof discoverAgentHooks> => {
+    const events = createEventBus();
+    events.on(AGENT_HOOKS_DISCOVER, (message) =>
+      register(message as AgentHooksDiscovery),
+    );
+    return discoverAgentHooks(events);
+  };
+
+  test("clean registrations deny nothing", () => {
+    expect(
+      discover((d) =>
+        d.register({ namespace: "ok", beforeAgentTool: () => undefined }),
+      ).toolDenial,
+    ).toBeUndefined();
+  });
+
+  test("duplicates, invalid registrations, and a failing ack deny", () => {
+    const acks: unknown[] = [];
+    const duplicate = discover((d) => {
+      for (const _ of [1, 2])
+        d.register({ namespace: "dup", beforeAgentTool: () => undefined });
+      d.register({
+        namespace: "other",
+        beforeAgentTool: () => undefined,
+        onAgentToolRegistration: (result) => acks.push(result),
+      });
+    });
+    expect(duplicate.toolDenial).toContain("dup");
+    expect(acks).toEqual([
+      { accepted: false, reason: "tool calls are blocked" },
+    ]);
+    expect(
+      discover((d) =>
+        d.register({ namespace: "bad ns", beforeAgentTool: () => undefined }),
+      ).toolDenial,
+    ).toBeDefined();
+    expect(
+      discover((d) =>
+        d.register({ namespace: "x", beforeAgentTool: "no" as never }),
+      ).toolDenial,
+    ).toBeDefined();
+    expect(
+      discover((d) =>
+        d.register({
+          namespace: "x",
+          beforeAgentTool: () => undefined,
+          onAgentToolRegistration: () => {
+            throw new Error("ack");
+          },
+        }),
+      ).toolDenial,
+    ).toBeDefined();
+    // Lifecycle-only duplicates don't touch tool gating.
+    expect(
+      discover((d) => {
+        d.register({ namespace: "life" });
+        d.register({ namespace: "life" });
+      }).toolDenial,
+    ).toBeUndefined();
+  });
+});

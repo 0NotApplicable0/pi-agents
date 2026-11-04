@@ -40,6 +40,7 @@ import {
   openAgentHarness,
 } from "../../src/host/harness.js";
 import { beforeRequestHooks } from "../../src/host/hooks.js";
+import { ToolGate } from "../../src/host/tool-hooks.js";
 
 export const MODEL = { provider: "faux", modelId: "faux-1" };
 
@@ -240,6 +241,8 @@ export class TestParent implements Parent {
 export interface HostOptions {
   settings?: AgentHarnessOptions["settings"];
   hooks?: readonly AgentHooks[];
+  /** Why every tool call is blocked. */
+  toolDenial?: string;
   captureExtensionState?: AgentServiceOptions["captureExtensionState"];
   storage?: Storage;
   models?: ReturnType<typeof createFaux>["models"];
@@ -272,7 +275,14 @@ export interface TestHost {
 
 const hosts = new Map<AgentService, TestHost>();
 
-export function testExtensions(options: HostOptions = {}): AgentExtensions {
+export function testExtensions(
+  options: HostOptions = {},
+  gate: ToolGate = new ToolGate(
+    "test-parent",
+    options.hooks ?? [],
+    options.toolDenial,
+  ),
+): AgentExtensions {
   return createAgentExtensions({
     prompt: {
       trusted: () => options.trusted ?? false,
@@ -280,6 +290,7 @@ export function testExtensions(options: HostOptions = {}): AgentExtensions {
     },
     resolveHelper: inheritHelper,
     hooks: [
+      ...gate.hooks,
       ...beforeRequestHooks("test-parent", options.hooks ?? []),
       ...(options.taskHooks ?? []),
     ],
@@ -302,8 +313,14 @@ export function testExtensions(options: HostOptions = {}): AgentExtensions {
 export async function openService(
   options: HostOptions = {},
 ): Promise<AgentService> {
-  const extensions = testExtensions(options);
+  const gate = new ToolGate(
+    "test-parent",
+    options.hooks ?? [],
+    options.toolDenial,
+  );
+  const extensions = testExtensions(options, gate);
   const harness = await openAgentHarness({
+    toolGate: gate,
     storage: options.storage ?? new MemoryStorage(),
     models: options.models ?? createFaux().models,
     identity: { attribution: null },
